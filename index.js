@@ -390,6 +390,124 @@ async function runOcrOnBuffer(buffer) {
 // HTTP: Twilio webhook
 // ---------------------------------------------------------------------------
 
+/**
+ * Twilio WhatsApp Sandbox / webhook: acknowledge via TwiML in the HTTP body.
+ * Twilio sends this <Message> to the user; avoid duplicating the same text with messages.create().
+ */
+function respondWhatsAppAck(res) {
+  res.set('Content-Type', 'text/xml');
+  return res.send(
+    `<Response>
+  <Message>היי! הודעתך התקבלה ✅</Message>
+</Response>`
+  );
+}
+
+/**
+ * OCR + DB + REST messages can take longer than Twilio’s webhook wait (~15s).
+ * That logic runs here *after* respondWhatsAppAck so the user always gets the TwiML reply in time.
+ */
+async function processWhatsAppInboundLogic(req, userPhone) {
+  let bodyText = (req.body.Body || '').trim();
+  const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
+  const ocrChunks = [];
+
+  if (numMedia > 0 && accountSid && authToken) {
+    for (let i = 0; i < numMedia; i++) {
+      const url = req.body[`MediaUrl${i}`];
+      if (!url) continue;
+      try {
+        const buf = await fetchMediaBuffer(url);
+        const ocr = await runOcrOnBuffer(buf);
+        if (ocr) ocrChunks.push(ocr);
+      } catch (e) {
+        console.error('[webhook] media:', e.message);
+        ocrChunks.push(`[Image ${i + 1}: could not read — ${e.message}]`);
+      }
+    }
+  } else if (numMedia > 0) {
+    ocrChunks.push('[Images skipped: Twilio credentials not set]');
+  }
+
+  const ocrCombined = ocrChunks.join('\n\n');
+  if (ocrCombined && bodyText) {
+    bodyText = `${bodyText}\n\n--- OCR ---\n${ocrCombined}`;
+  } else if (ocrCombined && !bodyText) {
+    bodyText = ocrCombined;
+  }
+
+  console.log(`Received message: ${bodyText || '(empty)'}`);
+
+  const cmd = parseCommand(req.body.Body || '');
+  const state = await readReminderState();
+  const awaiting =
+    state.users[userPhone] && state.users[userPhone].awaitingMonthlyConfirmation;
+
+  if (cmd === 'yes') {
+    if (awaiting) {
+      const n = await markCurrentMonthSubmitted(userPhone);
+      const msg =
+        n > 0
+          ? `Marked ${n} receipt(s) for this month as submitted. Thank you!`
+          : 'No receipts to mark for this month. Confirmation recorded.';
+      await sendWhatsApp(userPhone, msg);
+    } else {
+      await sendWhatsApp(
+        userPhone,
+        'There is no active monthly reminder to confirm. Your receipts are unchanged.'
+      );
+    }
+    return;
+  }
+
+  if (cmd === 'summary') {
+    const msg = await handleSummary(userPhone);
+    await sendWhatsApp(userPhone, msg);
+    return;
+  }
+  if (cmd === 'list') {
+    const msg = await handleList(userPhone);
+    await sendWhatsApp(userPhone, msg);
+    return;
+  }
+  if (cmd === 'submitted') {
+    const n = await markCurrentMonthSubmitted(userPhone);
+    await sendWhatsApp(
+      userPhone,
+      `Marked ${n} receipt(s) for this month as submitted.`
+    );
+    return;
+  }
+  if (cmd === 'pending') {
+    const msg = await handlePending(userPhone);
+    await sendWhatsApp(userPhone, msg);
+    return;
+  }
+
+  if (bodyText.length > 0) {
+    const amount = extractAmount(bodyText);
+    await addReceiptEntry({
+      userPhone,
+      originalText: bodyText,
+      amount,
+      status: 'pending',
+    });
+    const amtLine =
+      amount != null
+        ? `Parsed amount: ${amount.toFixed(2)} (verify if needed).`
+        : 'Could not parse an amount automatically; you can still use "summary".';
+    await sendWhatsApp(
+      userPhone,
+      `Saved receipt entry.\n${amtLine}\nCommands: summary, list, pending, submitted`
+    );
+  } else {
+    await sendWhatsApp(
+      userPhone,
+      'Send text describing a purchase or a receipt photo. Commands: summary, list, pending, submitted'
+    );
+  }
+}
+
 app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true });
 });
@@ -404,114 +522,17 @@ app.post('/whatsapp', async (req, res) => {
 
     await ensureReminderUser(userPhone);
 
-    let bodyText = (req.body.Body || '').trim();
-    const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
-    const ocrChunks = [];
+    // Must respond before OCR / slow work — Twilio times out ~15s waiting for this HTTP response.
+    respondWhatsAppAck(res);
 
-    if (numMedia > 0 && accountSid && authToken) {
-      for (let i = 0; i < numMedia; i++) {
-        const url = req.body[`MediaUrl${i}`];
-        if (!url) continue;
-        try {
-          const buf = await fetchMediaBuffer(url);
-          const ocr = await runOcrOnBuffer(buf);
-          if (ocr) ocrChunks.push(ocr);
-        } catch (e) {
-          console.error('[webhook] media:', e.message);
-          ocrChunks.push(`[Image ${i + 1}: could not read — ${e.message}]`);
-        }
-      }
-    } else if (numMedia > 0) {
-      ocrChunks.push('[Images skipped: Twilio credentials not set]');
-    }
-
-    const ocrCombined = ocrChunks.join('\n\n');
-    if (ocrCombined && bodyText) {
-      bodyText = `${bodyText}\n\n--- OCR ---\n${ocrCombined}`;
-    } else if (ocrCombined && !bodyText) {
-      bodyText = ocrCombined;
-    }
-
-    // Sandbox / debugging: log every inbound payload we will process (caption + OCR if any).
-    console.log(`Received message: ${bodyText || '(empty)'}`);
-
-    // Immediate acknowledgment for Twilio WhatsApp (Sandbox or live). Sent before commands / receipt logic.
-    const sandboxAckBody = 'היי! הודעתך התקבלה ✅';
-    await sendWhatsApp(userPhone, sandboxAckBody);
-
-    const cmd = parseCommand(req.body.Body || '');
-    const state = await readReminderState();
-    const awaiting =
-      state.users[userPhone] && state.users[userPhone].awaitingMonthlyConfirmation;
-
-    if (cmd === 'yes') {
-      if (awaiting) {
-        const n = await markCurrentMonthSubmitted(userPhone);
-        const msg =
-          n > 0
-            ? `Marked ${n} receipt(s) for this month as submitted. Thank you!`
-            : 'No receipts to mark for this month. Confirmation recorded.';
-        await sendWhatsApp(userPhone, msg);
-      } else {
-        await sendWhatsApp(
-          userPhone,
-          'There is no active monthly reminder to confirm. Your receipts are unchanged.'
-        );
-      }
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
-
-    if (cmd === 'summary') {
-      const msg = await handleSummary(userPhone);
-      await sendWhatsApp(userPhone, msg);
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
-    if (cmd === 'list') {
-      const msg = await handleList(userPhone);
-      await sendWhatsApp(userPhone, msg);
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
-    if (cmd === 'submitted') {
-      const n = await markCurrentMonthSubmitted(userPhone);
-      await sendWhatsApp(
-        userPhone,
-        `Marked ${n} receipt(s) for this month as submitted.`
-      );
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
-    if (cmd === 'pending') {
-      const msg = await handlePending(userPhone);
-      await sendWhatsApp(userPhone, msg);
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
-
-    if (bodyText.length > 0) {
-      const amount = extractAmount(bodyText);
-      await addReceiptEntry({
-        userPhone,
-        originalText: bodyText,
-        amount,
-        status: 'pending',
-      });
-      const amtLine =
-        amount != null
-          ? `Parsed amount: ${amount.toFixed(2)} (verify if needed).`
-          : 'Could not parse an amount automatically; you can still use "summary".';
-      await sendWhatsApp(
-        userPhone,
-        `Saved receipt entry.\n${amtLine}\nCommands: summary, list, pending, submitted`
-      );
-    } else {
-      await sendWhatsApp(
-        userPhone,
-        'Send text describing a purchase or a receipt photo. Commands: summary, list, pending, submitted'
-      );
-    }
-
-    return res.status(200).type('text/xml').send('<Response></Response>');
+    void processWhatsAppInboundLogic(req, userPhone).catch((err) =>
+      console.error('[webhook] async logic:', err)
+    );
   } catch (e) {
     console.error('[webhook] unhandled:', e);
-    return res.status(500).send('Server error');
+    if (!res.headersSent) {
+      return res.status(500).send('Server error');
+    }
   }
 });
 
