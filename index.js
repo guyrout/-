@@ -52,7 +52,7 @@ function loadGoogleServiceAccountCreds() {
 
 const serviceAccountCreds = loadGoogleServiceAccountCreds();
 
-const REPLY = 'היי! הבוט עובד 🎉';
+const REPLY = '🔥 הקוד החדש עובד 🔥';
 
 // --- Google Sheets: לקוח API נוצר פעם אחת (singleton) ---
 let sheetsClientPromise = null;
