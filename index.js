@@ -16,15 +16,37 @@ const REMINDER_STATE_PATH = path.join(__dirname, 'reminder-state.json');
 // Serialize writes to avoid corrupting JSON under concurrent webhook load.
 let fileWriteChain = Promise.resolve();
 
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const fromWhatsApp = normalizeWhatsAppAddress(process.env.FROM_WHATSAPP_NUMBER);
+// Twilio credentials — trim whitespace (common copy/paste issue on Render / .env).
+// Sandbox: use the WhatsApp sandbox "From" number from the Twilio console (e.g. whatsapp:+14155238886).
+const accountSid = (process.env.TWILIO_ACCOUNT_SID || '').trim();
+const authToken = (process.env.TWILIO_AUTH_TOKEN || '').trim();
+const fromWhatsApp = normalizeWhatsAppAddress(
+  (process.env.FROM_WHATSAPP_NUMBER || '').trim()
+);
 
-if (!accountSid || !authToken || !fromWhatsApp) {
-  console.warn(
-    '[config] Missing TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, or FROM_WHATSAPP_NUMBER. Outbound messages will fail until set.'
+function logTwilioEnvStatus() {
+  const sidOk = Boolean(accountSid);
+  const tokenOk = Boolean(authToken);
+  const fromOk = Boolean(fromWhatsApp);
+  console.log(
+    '[config] TWILIO_ACCOUNT_SID:',
+    sidOk ? `${accountSid.slice(0, 6)}… (${accountSid.length} chars)` : '(missing or empty)'
   );
+  console.log(
+    '[config] TWILIO_AUTH_TOKEN:',
+    tokenOk ? '(set)' : '(missing or empty)'
+  );
+  console.log(
+    '[config] FROM_WHATSAPP_NUMBER:',
+    fromOk ? fromWhatsApp : '(missing or empty)'
+  );
+  if (!sidOk || !tokenOk || !fromOk) {
+    console.warn(
+      '[config] Outbound WhatsApp (Sandbox or production) will fail until all three are set in the environment.'
+    );
+  }
 }
+logTwilioEnvStatus();
 
 const twilioClient =
   accountSid && authToken ? twilio(accountSid, authToken) : null;
@@ -410,6 +432,13 @@ app.post('/whatsapp', async (req, res) => {
       bodyText = ocrCombined;
     }
 
+    // Sandbox / debugging: log every inbound payload we will process (caption + OCR if any).
+    console.log(`Received message: ${bodyText || '(empty)'}`);
+
+    // Immediate acknowledgment for Twilio WhatsApp (Sandbox or live). Sent before commands / receipt logic.
+    const sandboxAckBody = 'היי! הודעתך התקבלה ✅';
+    await sendWhatsApp(userPhone, sandboxAckBody);
+
     const cmd = parseCommand(req.body.Body || '');
     const state = await readReminderState();
     const awaiting =
@@ -513,7 +542,8 @@ cron.schedule(
   cronOpts
 );
 
-const PORT = process.env.PORT || 3000;
+// Render (and other hosts) set PORT; default 3000 for local dev.
+const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 app.listen(PORT, () => {
   console.log(`Expense tracker listening on port ${PORT}`);
   console.log(`Webhook URL path: POST /whatsapp`);
