@@ -1,8 +1,10 @@
 /**
  * בוט WhatsApp (Twilio Sandbox) + שמירה ב-Google Sheets.
- * משתני סביבה ב-Render: Twilio, GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID (אופציונלי).
+ * אימות Google: קובץ מקומי Expense-Tracker-Bot.json (עדיף) או GOOGLE_SERVICE_ACCOUNT_JSON ב-Render.
  */
 
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
 const express = require('express');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -16,12 +18,37 @@ const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || '').trim();
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || '').trim();
 const FROM_WHATSAPP_NUMBER = (process.env.FROM_WHATSAPP_NUMBER || '').trim();
 
-// --- Google: Service Account JSON כמחרוזת שלמה ב-env; מזהה גיליון מ-GOOGLE_SHEET_ID או ברירת מחדל למטה ---
+// --- Google: מזהה גיליון מ-GOOGLE_SHEET_ID או ברירת מחדל ---
 // מזהה הגיליון (מקטע ה-URL /d/<ID>/edit): 1xd9BILngzkLX57ja4On73TIehGJIPkCmuS9aEjAhc48
 const GOOGLE_SHEET_ID = (
   process.env.GOOGLE_SHEET_ID || '1xd9BILngzkLX57ja4On73TIehGJIPkCmuS9aEjAhc48'
 ).trim();
-const GOOGLE_SERVICE_ACCOUNT_JSON = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+
+/**
+ * טוען Service Account: קודם קובץ מקומי (כמו const creds = require('./Expense-Tracker-Bot.json')),
+ * אם אין קובץ — מ-GOOGLE_SERVICE_ACCOUNT_JSON (Render).
+ */
+function loadGoogleServiceAccountCreds() {
+  const localPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
+  if (fs.existsSync(localPath)) {
+    try {
+      return require('./Expense-Tracker-Bot.json');
+    } catch (e) {
+      console.error('[config] Expense-Tracker-Bot.json:', e.message);
+    }
+  }
+  const raw = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+  if (raw) {
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON:', e.message);
+    }
+  }
+  return null;
+}
+
+const serviceAccountCreds = loadGoogleServiceAccountCreds();
 
 const REPLY = 'היי! הבוט עובד 🎉';
 
@@ -29,15 +56,14 @@ const REPLY = 'היי! הבוט עובד 🎉';
 let sheetsClientPromise = null;
 
 function getSpreadsheetDoc() {
-  if (!GOOGLE_SHEET_ID || !GOOGLE_SERVICE_ACCOUNT_JSON) {
+  if (!GOOGLE_SHEET_ID || !serviceAccountCreds) {
     return null;
   }
   if (!sheetsClientPromise) {
     sheetsClientPromise = (async () => {
-      const creds = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
       const serviceAccountAuth = new JWT({
-        email: creds.client_email,
-        key: creds.private_key,
+        email: serviceAccountCreds.client_email,
+        key: serviceAccountCreds.private_key,
         scopes: ['https://www.googleapis.com/auth/spreadsheets'],
       });
       // חובה פרמטר שני (JWT) — גישה לגיליון פרטי דרך Google Sheets API
@@ -133,10 +159,13 @@ function logTwilioEnvOnce() {
     FROM_WHATSAPP_NUMBER || '(missing)'
   );
   console.log('[config] GOOGLE_SHEET_ID:', GOOGLE_SHEET_ID || '(missing)');
-  console.log(
-    '[config] GOOGLE_SERVICE_ACCOUNT_JSON:',
-    GOOGLE_SERVICE_ACCOUNT_JSON ? '(set)' : '(missing)'
-  );
+  const localCredsPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
+  const credsSource = serviceAccountCreds
+    ? fs.existsSync(localCredsPath)
+      ? 'Expense-Tracker-Bot.json (local file)'
+      : 'GOOGLE_SERVICE_ACCOUNT_JSON (env)'
+    : '(missing — add Expense-Tracker-Bot.json or env)';
+  console.log('[config] Google Service Account:', credsSource);
 }
 logTwilioEnvOnce();
 
