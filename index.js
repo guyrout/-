@@ -1,6 +1,7 @@
 /**
  * בוט WhatsApp (Twilio Sandbox) + שמירה ב-Google Sheets.
- * אימות Google: קובץ מקומי Expense-Tracker-Bot.json (עדיף) או GOOGLE_SERVICE_ACCOUNT_JSON ב-Render.
+ * ב-Render: העלה Secret File בשם Expense-Tracker-Bot.json (ליד index.js) — נטען עם require.
+ * מקומית: אם אין קובץ, אפשר GOOGLE_SERVICE_ACCOUNT_JSON.
  */
 
 const fs = require('fs');
@@ -25,8 +26,9 @@ const GOOGLE_SHEET_ID = (
 ).trim();
 
 /**
- * טוען Service Account: קודם קובץ מקומי (כמו const creds = require('./Expense-Tracker-Bot.json')),
- * אם אין קובץ — מ-GOOGLE_SERVICE_ACCOUNT_JSON (Render).
+ * טוען Service Account: Secret File ב-Render (או קובץ מקומי) —
+ * const creds = require('./Expense-Tracker-Bot.json');
+ * אם הקובץ לא קיים — נסיון דרך GOOGLE_SERVICE_ACCOUNT_JSON (פיתוח / גיבוי).
  */
 function loadGoogleServiceAccountCreds() {
   const localPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
@@ -162,9 +164,9 @@ function logTwilioEnvOnce() {
   const localCredsPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
   const credsSource = serviceAccountCreds
     ? fs.existsSync(localCredsPath)
-      ? 'Expense-Tracker-Bot.json (local file)'
+      ? 'Expense-Tracker-Bot.json (Secret File / local)'
       : 'GOOGLE_SERVICE_ACCOUNT_JSON (env)'
-    : '(missing — add Expense-Tracker-Bot.json or env)';
+    : '(missing — add Expense-Tracker-Bot.json Secret File or env)';
   console.log('[config] Google Service Account:', credsSource);
 }
 logTwilioEnvOnce();
