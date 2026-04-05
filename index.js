@@ -199,6 +199,37 @@ app.post('/whatsapp', async (req, res) => {
   sendTwiML(res, responseText);
 });
 
+/**
+ * Webhook חלופי — לוגיקה פשוטה: אם יש ספרות בהודעה → "שמרתי …₪" + שורה ב-Sheets;
+ * אחרת → "קיבלתי ממך: …".
+ * ב-Twilio הגדר URL: POST …/webhook (או השאר /whatsapp כפי שכבר מוגדר).
+ */
+app.post('/webhook', async (req, res) => {
+  try {
+    const message = req.body.Body || '';
+    const match = message.match(/\d+/);
+
+    let reply = '';
+
+    if (match) {
+      const amount = match[0];
+      try {
+        await appendMessageRow(message, parseFloat(amount) || 0);
+      } catch (e) {
+        console.error('[webhook] sheets:', e.message);
+      }
+      reply = `שמרתי ${amount}₪`;
+    } else {
+      reply = `קיבלתי ממך: ${message}`;
+    }
+
+    sendTwiML(res, reply);
+  } catch (error) {
+    console.error('Error:', error);
+    sendTwiML(res, 'קרתה שגיאה, נסה שוב');
+  }
+});
+
 const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 
 // --- בדיקות אוטומטיות (רק כש-SMOKE_TEST=1): יחידה + POST ל-/whatsapp ---
@@ -285,5 +316,6 @@ if (process.env.SMOKE_TEST === '1') {
 } else {
   app.listen(PORT, () => {
     console.log(`Listening on ${PORT}`);
+    console.log('Webhooks: POST /whatsapp  |  POST /webhook');
   });
 }
