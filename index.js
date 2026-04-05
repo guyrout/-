@@ -128,6 +128,11 @@ async function appendMessageRow(messageBody, amount) {
   });
 }
 
+/** שמירה ל-Google Sheets (ל-/webhook) — עוטף את appendMessageRow */
+async function saveToSheet(message, amount) {
+  await appendMessageRow(message, parseFloat(amount) || 0);
+}
+
 /** סכום כל הערכים בעמודת Amount (לפקודת summary) */
 async function sumAmountColumn() {
   const doc = await getSpreadsheetDoc();
@@ -207,14 +212,15 @@ app.post('/whatsapp', async (req, res) => {
 app.post('/webhook', async (req, res) => {
   try {
     const message = req.body.Body || '';
-    const match = message.match(/\d+/);
 
     let reply = '';
+
+    const match = message.match(/\d+/);
 
     if (match) {
       const amount = match[0];
       try {
-        await appendMessageRow(message, parseFloat(amount) || 0);
+        await saveToSheet(message, amount);
       } catch (e) {
         console.error('[webhook] sheets:', e.message);
       }
@@ -223,10 +229,18 @@ app.post('/webhook', async (req, res) => {
       reply = `קיבלתי ממך: ${message}`;
     }
 
-    sendTwiML(res, reply);
+    res.set('Content-Type', 'text/xml; charset=utf-8');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>${escapeXml(reply)}</Message>
+</Response>`);
   } catch (error) {
-    console.error('Error:', error);
-    sendTwiML(res, 'קרתה שגיאה, נסה שוב');
+    console.error(error);
+    res.set('Content-Type', 'text/xml; charset=utf-8');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>${escapeXml('קרתה שגיאה, נסה שוב')}</Message>
+</Response>`);
   }
 });
 
