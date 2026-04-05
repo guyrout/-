@@ -16,7 +16,8 @@ const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || '').trim();
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || '').trim();
 const FROM_WHATSAPP_NUMBER = (process.env.FROM_WHATSAPP_NUMBER || '').trim();
 
-// --- Google: Service Account JSON כמחרוזת שלמה ב-env; מזהה גיליון מ-GOOGLE_SHEET_ID או ברירת מחדל ---
+// --- Google: Service Account JSON כמחרוזת שלמה ב-env; מזהה גיליון מ-GOOGLE_SHEET_ID או ברירת מחדל למטה ---
+// מזהה הגיליון (מקטע ה-URL /d/<ID>/edit): 1xd9BILngzkLX57ja4On73TIehGJIPkCmuS9aEjAhc48
 const GOOGLE_SHEET_ID = (
   process.env.GOOGLE_SHEET_ID || '1xd9BILngzkLX57ja4On73TIehGJIPkCmuS9aEjAhc48'
 ).trim();
