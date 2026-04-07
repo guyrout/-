@@ -191,6 +191,92 @@ async function sumAmountColumn() {
   return total;
 }
 
+const HEB_MONTHS = [
+  'ינואר', 'פברואר', 'מרץ', 'אפריל', 'מאי', 'יוני',
+  'יולי', 'אוגוסט', 'ספטמבר', 'אוקטובר', 'נובמבר', 'דצמבר',
+];
+
+const SUMMARY_FOOTERS = [
+  'אל תשכח לשמור את הקבלות המקוריות! 📑',
+  'הכסף הזה חוזר אליך! 💸',
+  'שמור על הסדר — זה משתלם! 🗂️',
+];
+
+/**
+ * בונה סיכום חודשי מעוצב עם WhatsApp markdown.
+ * מסנן רק שורות מהחודש הנוכחי, מקבץ לפי קטגוריה.
+ */
+async function buildMonthlySummary() {
+  const doc = await getSpreadsheetDoc();
+  if (!doc) return null;
+  const sheet = doc.sheetsByIndex[0];
+  await sheet.loadHeaderRow(1);
+  const rows = await sheet.getRows();
+
+  const now = new Date();
+  const curYear = now.getFullYear();
+  const curMonth = now.getMonth();
+  const monthName = HEB_MONTHS[curMonth];
+
+  const categoryTotals = new Map();
+  const categoryItems = new Map();
+
+  for (const row of rows) {
+    const dateStr =
+      typeof row.get === 'function' ? row.get('Date') : row.Date;
+    const d = new Date(dateStr);
+    if (d.getFullYear() !== curYear || d.getMonth() !== curMonth) continue;
+
+    const amt = parseFloat(
+      typeof row.get === 'function' ? row.get('Amount') : row.Amount
+    );
+    if (Number.isNaN(amt) || amt === 0) continue;
+
+    const cat =
+      (typeof row.get === 'function' ? row.get('Category') : row.Category) ||
+      DEFAULT_CATEGORY;
+    const desc =
+      (typeof row.get === 'function'
+        ? row.get('Description')
+        : row.Description) || '';
+
+    categoryTotals.set(cat, (categoryTotals.get(cat) || 0) + amt);
+    if (!categoryItems.has(cat)) categoryItems.set(cat, []);
+    categoryItems.get(cat).push({ desc, amt });
+  }
+
+  if (categoryTotals.size === 0) {
+    return 'עדיין אין הוצאות רשומות לחודש זה. רוצה לרשום משהו עכשיו? ✍️';
+  }
+
+  let grandTotal = 0;
+  const lines = [];
+
+  lines.push(`📊 *סיכום החזרים חודשי - ${monthName}*`);
+  lines.push('─────────────────────');
+
+  const sorted = [...categoryTotals.entries()].sort((a, b) => b[1] - a[1]);
+
+  for (const [cat, total] of sorted) {
+    grandTotal += total;
+    const emoji = cat.match(/\p{Emoji_Presentation}/u)?.[0] || '•';
+    lines.push(`${emoji} *${cat}*: ${total} ₪`);
+    const items = categoryItems.get(cat) || [];
+    if (items.length > 1) {
+      for (const it of items) {
+        lines.push(`      ${it.desc} — ${it.amt} ₪`);
+      }
+    }
+  }
+
+  lines.push('─────────────────────');
+  lines.push(`💰 *סה"כ מצטבר להחזר: ${grandTotal} ₪*`);
+  lines.push('');
+  lines.push(SUMMARY_FOOTERS[Math.floor(Math.random() * SUMMARY_FOOTERS.length)]);
+
+  return lines.join('\n');
+}
+
 // ===================== Proactive Messaging =====================
 
 async function sendWhatsAppMessage(to, body) {
@@ -277,7 +363,10 @@ app.post('/whatsapp', async (req, res) => {
   if (lower === 'summary' || lower === 'סיכום') {
     let responseText;
     try {
-      responseText = `סה״כ הוצאות: ${await sumAmountColumn()}₪`;
+      responseText = await buildMonthlySummary();
+      if (!responseText) {
+        responseText = `סה״כ הוצאות: ${await sumAmountColumn()}₪`;
+      }
     } catch (e) {
       console.error('[sheets] summary failed:', e.message);
       responseText = 'לא הצלחתי לשלוף סיכום, נסה שוב';
