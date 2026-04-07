@@ -52,8 +52,6 @@ function loadGoogleServiceAccountCreds() {
 
 const serviceAccountCreds = loadGoogleServiceAccountCreds();
 
-const REPLY = '🔥 הקוד החדש עובד 🔥';
-
 // --- Google Sheets: לקוח API נוצר פעם אחת (singleton) ---
 let sheetsClientPromise = null;
 
@@ -77,12 +75,20 @@ function getSpreadsheetDoc() {
   return sheetsClientPromise;
 }
 
-/** חילוץ המספר הראשון בהודעה לעמודת Amount (אם אין מספר → 0) */
-function firstNumberInMessage(text) {
-  if (!text || typeof text !== 'string') return 0;
-  const m = text.match(/\d+(?:[.,]\d+)?/);
-  if (!m) return 0;
-  return parseFloat(m[0].replace(',', '.')) || 0;
+/**
+ * מפרק הודעה לסכום ותיאור.
+ * "150 דלק" → { amount: 150, description: "דלק" }
+ * "קפה 25"  → { amount: 25,  description: "קפה" }
+ * "שלום"    → { amount: 0,   description: "שלום" }
+ */
+function parseExpenseMessage(text) {
+  if (!text || typeof text !== 'string') return { amount: 0, description: '' };
+  const trimmed = text.trim();
+  const m = trimmed.match(/\d+(?:[.,]\d+)?/);
+  if (!m) return { amount: 0, description: trimmed };
+  const amount = parseFloat(m[0].replace(',', '.')) || 0;
+  const description = trimmed.replace(m[0], '').replace(/\s+/g, ' ').trim();
+  return { amount, description };
 }
 
 function escapeXml(s) {
@@ -104,10 +110,10 @@ function sendTwiML(res, messageText) {
 }
 
 /**
- * שמירת שורה בגיליון הראשון: עמודות Date, Message, Amount.
+ * שמירת שורה בגיליון הראשון: עמודות Date, Description, Amount.
  * אם הגיליון ריק — נוצרת שורת כותרות מתאימה.
  */
-async function appendMessageRow(messageBody, amount) {
+async function appendExpenseRow(description, amount) {
   const doc = await getSpreadsheetDoc();
   if (!doc) return;
   const sheet = doc.sheetsByIndex[0];
@@ -116,21 +122,21 @@ async function appendMessageRow(messageBody, amount) {
   const hasHeaders =
     headers.length >= 3 &&
     headers[0] === 'Date' &&
-    headers[1] === 'Message' &&
+    headers[1] === 'Description' &&
     headers[2] === 'Amount';
   if (!hasHeaders && headers.filter(Boolean).length === 0) {
-    await sheet.setHeaderRow(['Date', 'Message', 'Amount']);
+    await sheet.setHeaderRow(['Date', 'Description', 'Amount']);
   }
   await sheet.addRow({
     Date: new Date().toISOString(),
-    Message: messageBody,
+    Description: description,
     Amount: amount,
   });
 }
 
-/** שמירה ל-Google Sheets (ל-/webhook) — עוטף את appendMessageRow */
-async function saveToSheet(message, amount) {
-  await appendMessageRow(message, parseFloat(amount) || 0);
+/** שמירה ל-Google Sheets (ל-/webhook) — עוטף את appendExpenseRow */
+async function saveToSheet(description, amount) {
+  await appendExpenseRow(description, parseFloat(amount) || 0);
 }
 
 /** סכום כל הערכים בעמודת Amount (לפקודת summary) */
@@ -180,28 +186,42 @@ const TWILIO_FROM_TEST = 'whatsapp:+15551234567';
 
 app.post('/whatsapp', async (req, res) => {
   const bodyRaw = req.body.Body ?? '';
-  console.log(bodyRaw || '(no Body)');
+  console.log('[whatsapp]', bodyRaw || '(no Body)');
 
   const trimmed = String(bodyRaw).trim();
-  const amount = firstNumberInMessage(trimmed);
   const isSummary = trimmed.toLowerCase() === 'summary';
 
-  try {
-    await appendMessageRow(trimmed, amount);
-  } catch (e) {
-    console.error('[sheets] append failed:', e.message);
-  }
-
-  let responseText = REPLY;
   if (isSummary) {
+    let responseText;
     try {
-      responseText = `סה״כ: ${await sumAmountColumn()}`;
+      responseText = `סה״כ הוצאות: ${await sumAmountColumn()}₪`;
     } catch (e) {
       console.error('[sheets] summary failed:', e.message);
+      responseText = 'לא הצלחתי לשלוף סיכום, נסה שוב';
     }
+    sendTwiML(res, responseText);
+    return;
   }
 
-  sendTwiML(res, responseText);
+  const { amount, description } = parseExpenseMessage(trimmed);
+
+  if (!amount) {
+    sendTwiML(
+      res,
+      'כדי לרשום הוצאה, שלח מספר + תיאור.\nלדוגמה: 150 דלק\nאו: קפה 12'
+    );
+    return;
+  }
+
+  try {
+    await appendExpenseRow(description || '(ללא תיאור)', amount);
+  } catch (e) {
+    console.error('[sheets] append failed:', e.message);
+    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+    return;
+  }
+
+  sendTwiML(res, `נשמר! ${amount}₪ — ${description || '(ללא תיאור)'}`);
 });
 
 /**
@@ -249,12 +269,14 @@ const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 // --- בדיקות אוטומטיות (רק כש-SMOKE_TEST=1): יחידה + POST ל-/whatsapp ---
 function runLocalUnitChecks() {
   console.log('\n=== [smoke] בדיקות יחידה (ללא רשת) ===');
-  const a = firstNumberInMessage('hello');
-  const b = firstNumberInMessage('receipt 42.5');
-  const c = firstNumberInMessage('קפה 12,30');
-  console.log('  firstNumber("hello") →', a, a === 0 ? '✓' : '✗');
-  console.log('  firstNumber("receipt 42.5") →', b, b === 42.5 ? '✓' : '✗');
-  console.log('  firstNumber("קפה 12,30") →', c, c === 12.3 ? '✓' : '✗');
+  const a = parseExpenseMessage('hello');
+  const b = parseExpenseMessage('150 דלק');
+  const c = parseExpenseMessage('קפה 12,30');
+  const d = parseExpenseMessage('42.5');
+  console.log('  parse("hello") →', JSON.stringify(a), a.amount === 0 ? '✓' : '✗');
+  console.log('  parse("150 דלק") →', JSON.stringify(b), b.amount === 150 && b.description === 'דלק' ? '✓' : '✗');
+  console.log('  parse("קפה 12,30") →', JSON.stringify(c), c.amount === 12.3 && c.description === 'קפה' ? '✓' : '✗');
+  console.log('  parse("42.5") →', JSON.stringify(d), d.amount === 42.5 && d.description === '' ? '✓' : '✗');
 }
 
 function postForm(port, fields) {
