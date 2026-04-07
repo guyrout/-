@@ -105,12 +105,6 @@ function matchCategory(description) {
 
 // ===================== Message Parsing =====================
 
-/**
- * מפרק הודעה לסכום ותיאור.
- * "150 דלק" → { amount: 150, description: "דלק" }
- * "קפה 25"  → { amount: 25,  description: "קפה" }
- * "שלום"    → { amount: 0,   description: "שלום" }
- */
 function parseExpenseMessage(text) {
   if (!text || typeof text !== 'string') return { amount: 0, description: '' };
   const trimmed = text.trim();
@@ -146,7 +140,7 @@ const SHEET_HEADERS = ['Date', 'Description', 'Amount', 'Category'];
 
 async function appendExpenseRow(description, amount, category) {
   const doc = await getSpreadsheetDoc();
-  if (!doc) return;
+  if (!doc) return null;
   const sheet = doc.sheetsByIndex[0];
   await sheet.loadHeaderRow(1);
   const headers = sheet.headerValues || [];
@@ -159,16 +153,28 @@ async function appendExpenseRow(description, amount, category) {
   if (!hasHeaders && headers.filter(Boolean).length === 0) {
     await sheet.setHeaderRow(SHEET_HEADERS);
   }
-  await sheet.addRow({
+  const row = await sheet.addRow({
     Date: new Date().toISOString(),
     Description: description,
     Amount: amount,
     Category: category,
   });
+  return row;
+}
+
+async function deleteRow(row) {
+  if (!row) return false;
+  try {
+    await row.delete();
+    return true;
+  } catch (e) {
+    console.error('[sheets] delete failed:', e.message);
+    return false;
+  }
 }
 
 async function saveToSheet(description, amount, category) {
-  await appendExpenseRow(
+  return appendExpenseRow(
     description,
     parseFloat(amount) || 0,
     category || DEFAULT_CATEGORY
@@ -202,10 +208,6 @@ const SUMMARY_FOOTERS = [
   'שמור על הסדר — זה משתלם! 🗂️',
 ];
 
-/**
- * בונה סיכום חודשי מעוצב עם WhatsApp markdown.
- * מסנן רק שורות מהחודש הנוכחי, מקבץ לפי קטגוריה.
- */
 async function buildMonthlySummary() {
   const doc = await getSpreadsheetDoc();
   if (!doc) return null;
@@ -296,20 +298,55 @@ async function sendWhatsAppMessage(to, body) {
   }
 }
 
-// ===================== Conversation State =====================
+// ===================== Session State Machine =====================
 
-const pendingDailyPrompt = new Map();
+const HIGH_AMOUNT_THRESHOLD = 2000;
+const SESSION_TTL_MS = 10 * 60 * 1000;
+const UNDO_TTL_MS = 5 * 60 * 1000;
 const DAILY_PROMPT_TTL_MS = 4 * 60 * 60 * 1000;
 
-function setDailyPrompt(phone) {
-  pendingDailyPrompt.set(phone, Date.now());
+/**
+ * Per-user session. States:
+ *   IDLE                  — default, no pending interaction
+ *   AWAITING_DESCRIPTION  — got a number-only message, waiting for description text
+ *   AWAITING_HIGH_CONFIRM — amount > 2000, waiting for כן/לא
+ *   AWAITING_DAILY_REPLY  — cron sent daily prompt, waiting for כן/לא
+ */
+const sessions = new Map();
+
+function getSession(phone) {
+  if (!sessions.has(phone)) {
+    sessions.set(phone, { state: 'IDLE', ts: Date.now() });
+  }
+  return sessions.get(phone);
 }
 
-function consumeDailyPrompt(phone) {
-  const ts = pendingDailyPrompt.get(phone);
-  if (!ts) return false;
-  pendingDailyPrompt.delete(phone);
-  return Date.now() - ts < DAILY_PROMPT_TTL_MS;
+function resetSession(phone) {
+  sessions.set(phone, { state: 'IDLE', ts: Date.now() });
+}
+
+function isSessionExpired(session) {
+  const ttl =
+    session.state === 'AWAITING_DAILY_REPLY'
+      ? DAILY_PROMPT_TTL_MS
+      : SESSION_TTL_MS;
+  return Date.now() - session.ts > ttl;
+}
+
+function canUndo(session) {
+  return (
+    session.lastRow &&
+    session.lastRowTs &&
+    Date.now() - session.lastRowTs < UNDO_TTL_MS
+  );
+}
+
+function confirmationMsg(amount, desc, category) {
+  return (
+    `רשמתי לי 🙂 *${amount} ₪* עבור *${desc}*.\n` +
+    `זה נכנס תחת ${category}.\n\n` +
+    `לביטול הרישום, השב *"מחק"*`
+  );
 }
 
 // ===================== Config Log =====================
@@ -331,6 +368,7 @@ function logConfigOnce() {
     : '(missing — add Expense-Tracker-Bot.json Secret File or env)';
   console.log('[config] Google Service Account:', credsSource);
   console.log('[config] Twilio client:', twilioClient ? 'ready' : '(disabled — missing SID/token)');
+  console.log('[config] HIGH_AMOUNT_THRESHOLD:', HIGH_AMOUNT_THRESHOLD, '₪');
 }
 logConfigOnce();
 
@@ -345,27 +383,39 @@ app.post('/whatsapp', async (req, res) => {
 
   const trimmed = String(bodyRaw).trim();
   const lower = trimmed.toLowerCase();
+  const phone = from.replace('whatsapp:', '');
+  const session = getSession(phone);
 
-  // --- Daily prompt reply (כן / לא) ---
-  const senderPhone = from.replace('whatsapp:', '');
-  if (consumeDailyPrompt(senderPhone)) {
-    if (['כן', 'yes', 'כ'].includes(lower)) {
-      sendTwiML(res, 'מעולה! שלח לי את ההוצאות ואני ארשום 📝');
-      return;
-    }
-    if (['לא', 'no', 'ל'].includes(lower)) {
-      sendTwiML(res, 'יופי, ערב טוב! 🌙');
-      return;
-    }
+  // Expire stale sessions
+  if (session.state !== 'IDLE' && isSessionExpired(session)) {
+    resetSession(phone);
+    session.state = 'IDLE';
   }
 
-  // --- Summary ---
+  // ─── 1. UNDO (מחק) ───
+  if (lower === 'מחק' || lower === 'undo') {
+    if (canUndo(session)) {
+      const ok = await deleteRow(session.lastRow);
+      session.lastRow = null;
+      session.lastRowTs = null;
+      if (ok) {
+        sendTwiML(res, '✓ הרישום האחרון בוטל בהצלחה.');
+      } else {
+        sendTwiML(res, 'לא הצלחתי למחוק, נסה שוב.');
+      }
+    } else {
+      sendTwiML(res, 'אין רישום אחרון לביטול (או שעבר יותר מ-5 דקות).');
+    }
+    return;
+  }
+
+  // ─── 2. SUMMARY (סיכום) ───
   if (lower === 'summary' || lower === 'סיכום') {
     let responseText;
     try {
       responseText = await buildMonthlySummary();
       if (!responseText) {
-        responseText = `סה״כ הוצאות: ${await sumAmountColumn()}₪`;
+        responseText = `סה״כ הוצאות: ${await sumAmountColumn()} ₪`;
       }
     } catch (e) {
       console.error('[sheets] summary failed:', e.message);
@@ -375,33 +425,141 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  // --- Parse expense ---
+  // ─── 3. AWAITING_DAILY_REPLY (כן / לא after cron prompt) ───
+  if (session.state === 'AWAITING_DAILY_REPLY') {
+    resetSession(phone);
+    if (['כן', 'yes', 'כ'].includes(lower)) {
+      sendTwiML(res, 'מעולה! שלח לי את ההוצאות ואני ארשום 📝');
+      return;
+    }
+    if (['לא', 'no', 'ל'].includes(lower)) {
+      sendTwiML(res, 'יופי, ערב טוב! 🌙');
+      return;
+    }
+    // Not yes/no — fall through to normal parsing
+  }
+
+  // ─── 4. AWAITING_DESCRIPTION (user sent number only, now sending description) ───
+  if (session.state === 'AWAITING_DESCRIPTION') {
+    const pendingAmount = session.pendingAmount;
+    const desc = trimmed || '(ללא תיאור)';
+    const category = matchCategory(desc);
+
+    // If user sends another number instead of description, treat as new expense
+    const parsed = parseExpenseMessage(trimmed);
+    if (parsed.amount && parsed.description) {
+      resetSession(phone);
+      // Fall through — will be handled below as a normal expense
+    } else {
+      resetSession(phone);
+
+      if (pendingAmount > HIGH_AMOUNT_THRESHOLD) {
+        const s = getSession(phone);
+        s.state = 'AWAITING_HIGH_CONFIRM';
+        s.pendingAmount = pendingAmount;
+        s.pendingDesc = desc;
+        s.pendingCategory = category;
+        s.ts = Date.now();
+        sendTwiML(
+          res,
+          `זה סכום גבוה מהרגיל (*${pendingAmount} ₪*), אתה בטוח שזה נכון? (כן / לא)`
+        );
+        return;
+      }
+
+      try {
+        const row = await appendExpenseRow(desc, pendingAmount, category);
+        const s = getSession(phone);
+        s.lastRow = row;
+        s.lastRowTs = Date.now();
+        sendTwiML(res, confirmationMsg(pendingAmount, desc, category));
+      } catch (e) {
+        console.error('[sheets] append failed:', e.message);
+        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+      }
+      return;
+    }
+  }
+
+  // ─── 5. AWAITING_HIGH_CONFIRM (כן / לא for high amount) ───
+  if (session.state === 'AWAITING_HIGH_CONFIRM') {
+    const { pendingAmount, pendingDesc, pendingCategory } = session;
+    resetSession(phone);
+
+    if (['כן', 'yes', 'כ'].includes(lower)) {
+      try {
+        const row = await appendExpenseRow(pendingDesc, pendingAmount, pendingCategory);
+        const s = getSession(phone);
+        s.lastRow = row;
+        s.lastRowTs = Date.now();
+        sendTwiML(res, confirmationMsg(pendingAmount, pendingDesc, pendingCategory));
+      } catch (e) {
+        console.error('[sheets] append failed:', e.message);
+        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+      }
+      return;
+    }
+    if (['לא', 'no', 'ל'].includes(lower)) {
+      sendTwiML(res, 'בוטל ✓ הרישום לא נשמר.');
+      return;
+    }
+    // Not yes/no — fall through to normal parsing
+  }
+
+  // ─── 6. NORMAL EXPENSE PARSING ───
   const { amount, description } = parseExpenseMessage(trimmed);
 
   if (!amount) {
     sendTwiML(
       res,
-      'כדי לרשום הוצאה, שלח מספר + תיאור.\nלדוגמה: 150 דלק\nאו: תספורת 50'
+      'כדי לרשום הוצאה, שלח מספר + תיאור.\nלדוגמה: *150 דלק*\nאו: *תספורת 50*'
     );
     return;
   }
 
-  const desc = description || '(ללא תיאור)';
-  const category = matchCategory(description);
-
-  try {
-    await appendExpenseRow(desc, amount, category);
-  } catch (e) {
-    console.error('[sheets] append failed:', e.message);
-    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+  // Number only, no description → ask for description
+  if (!description) {
+    const s = getSession(phone);
+    s.state = 'AWAITING_DESCRIPTION';
+    s.pendingAmount = amount;
+    s.ts = Date.now();
+    sendTwiML(res, `קיבלתי *${amount} ₪*. עבור מה ההוצאה? (למשל: חניה)`);
     return;
   }
 
-  sendTwiML(res, `רשמתי לי 🙂 ${amount} ש"ח עבור ${desc}. זה נכנס תחת ${category}.`);
+  const desc = description;
+  const category = matchCategory(desc);
+
+  // High amount validation
+  if (amount > HIGH_AMOUNT_THRESHOLD) {
+    const s = getSession(phone);
+    s.state = 'AWAITING_HIGH_CONFIRM';
+    s.pendingAmount = amount;
+    s.pendingDesc = desc;
+    s.pendingCategory = category;
+    s.ts = Date.now();
+    sendTwiML(
+      res,
+      `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`
+    );
+    return;
+  }
+
+  // Normal save
+  try {
+    const row = await appendExpenseRow(desc, amount, category);
+    const s = getSession(phone);
+    s.lastRow = row;
+    s.lastRowTs = Date.now();
+    sendTwiML(res, confirmationMsg(amount, desc, category));
+  } catch (e) {
+    console.error('[sheets] append failed:', e.message);
+    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+  }
 });
 
 /**
- * Webhook חלופי — אם יש ספרות בהודעה → "שמרתי …₪" + שורה ב-Sheets;
+ * Webhook חלופי — אם יש ספרות בהודעה → שומר + מאשר;
  * אחרת → "קיבלתי ממך: …".
  */
 app.post('/webhook', async (req, res) => {
@@ -417,7 +575,7 @@ app.post('/webhook', async (req, res) => {
       } catch (e) {
         console.error('[webhook] sheets:', e.message);
       }
-      sendTwiML(res, `רשמתי לי 🙂 ${amount} ש"ח עבור ${desc}. זה נכנס תחת ${category}.`);
+      sendTwiML(res, `רשמתי לי 🙂 *${amount} ₪* עבור *${desc}*. זה נכנס תחת ${category}.`);
     } else {
       sendTwiML(res, `קיבלתי ממך: ${message}`);
     }
@@ -432,12 +590,14 @@ app.post('/webhook', async (req, res) => {
 const CRON_TZ = process.env.CRON_TZ || 'Asia/Jerusalem';
 
 if (TO_WHATSAPP_NUMBER && twilioClient) {
-  // יומי 20:00 — שאל אם היו הוצאות היום
   cron.schedule(
     '0 20 * * *',
     async () => {
       console.log('[cron] Daily expense prompt');
-      setDailyPrompt(TO_WHATSAPP_NUMBER.replace('whatsapp:', ''));
+      const phone = TO_WHATSAPP_NUMBER.replace('whatsapp:', '');
+      const s = getSession(phone);
+      s.state = 'AWAITING_DAILY_REPLY';
+      s.ts = Date.now();
       await sendWhatsAppMessage(
         TO_WHATSAPP_NUMBER,
         'היי! 👋 היו לך הוצאות היום? (כן / לא)'
@@ -446,14 +606,13 @@ if (TO_WHATSAPP_NUMBER && twilioClient) {
     { timezone: CRON_TZ }
   );
 
-  // חודשי — 29 בחודש ב-20:00 — תזכורת דוחות
   cron.schedule(
     '0 20 29 * *',
     async () => {
       console.log('[cron] Monthly report reminder');
       await sendWhatsAppMessage(
         TO_WHATSAPP_NUMBER,
-        'תזכורת חודשית 📋 הגיע הזמן להגיש דוחות!\nשלח "סיכום" לקבלת סה״כ ההוצאות.'
+        'תזכורת חודשית 📋 הגיע הזמן להגיש דוחות!\nשלח *"סיכום"* לקבלת סה״כ ההוצאות.'
       );
     },
     { timezone: CRON_TZ }
@@ -533,22 +692,30 @@ function postForm(port, urlPath, fields) {
 
 async function runHttpSmokeTests(port) {
   console.log('\n=== [smoke] בדיקות HTTP ===');
+  const F = TWILIO_FROM_TEST;
+
   const cases = [
-    { name: 'ללא מספר', path: '/whatsapp', fields: { Body: 'שלום', From: TWILIO_FROM_TEST } },
-    { name: '150 דלק', path: '/whatsapp', fields: { Body: '150 דלק', From: TWILIO_FROM_TEST } },
-    { name: 'תרופות 80', path: '/whatsapp', fields: { Body: 'תרופות 80', From: TWILIO_FROM_TEST } },
-    { name: 'מונית 45', path: '/whatsapp', fields: { Body: 'מונית 45', From: TWILIO_FROM_TEST } },
-    { name: 'summary', path: '/whatsapp', fields: { Body: 'summary', From: TWILIO_FROM_TEST } },
-    { name: 'סיכום', path: '/whatsapp', fields: { Body: 'סיכום', From: TWILIO_FROM_TEST } },
-    { name: 'webhook 200', path: '/webhook', fields: { Body: '200 חנייה', From: TWILIO_FROM_TEST } },
+    { name: 'ללא מספר → help', fields: { Body: 'שלום', From: F } },
+    { name: '150 דלק → save', fields: { Body: '150 דלק', From: F } },
+    { name: 'מחק → undo (no row)', fields: { Body: 'מחק', From: F } },
+    { name: 'תרופות 80 → save+cat', fields: { Body: 'תרופות 80', From: F } },
+    { name: '42 → ask desc', fields: { Body: '42', From: F } },
+    { name: 'חניה → complete', fields: { Body: 'חניה', From: F } },
+    { name: '3000 דלק → high confirm', fields: { Body: '3000 דלק', From: F } },
+    { name: 'כן → confirm high', fields: { Body: 'כן', From: F } },
+    { name: 'סיכום → summary', fields: { Body: 'סיכום', From: F } },
+    { name: 'webhook 200 חנייה', path: '/webhook', fields: { Body: '200 חנייה', From: F } },
   ];
 
   for (const t of cases) {
     try {
-      const { status, body } = await postForm(port, t.path, t.fields);
-      const preview = body.replace(/\s+/g, ' ').slice(0, 200);
-      console.log(`  [${t.name}] HTTP ${status}`);
-      console.log(`    ${preview}${body.length > 200 ? '…' : ''}`);
+      const { status, body } = await postForm(port, t.path || '/whatsapp', t.fields);
+      const text = body
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120);
+      console.log(`  [${t.name}] ${status} → ${text}${body.length > 120 ? '…' : ''}`);
     } catch (e) {
       console.error(`  [${t.name}] שגיאה:`, e.message);
     }
