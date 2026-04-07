@@ -1,7 +1,7 @@
 /**
  * בוט WhatsApp (Twilio Sandbox) + שמירה ב-Google Sheets.
- * ב-Render: העלה Secret File בשם Expense-Tracker-Bot.json (ליד index.js) — נטען עם require.
- * מקומית: אם אין קובץ, אפשר GOOGLE_SERVICE_ACCOUNT_JSON.
+ * Reimbursement Maximization & Audit-Ready Tracking.
+ * Columns: Date | Description | Amount | Category | Receipt | Submitted
  */
 
 const fs = require('fs');
@@ -57,7 +57,6 @@ function loadGoogleServiceAccountCreds() {
 }
 
 const serviceAccountCreds = loadGoogleServiceAccountCreds();
-
 let sheetsClientPromise = null;
 
 function getSpreadsheetDoc() {
@@ -76,6 +75,37 @@ function getSpreadsheetDoc() {
   }
   return sheetsClientPromise;
 }
+
+// ===================== Hebrew Prefix-Aware Matching =====================
+
+const HEB_PREFIX_RE = /^[הובלמכשת]/;
+
+function matchesAny(text, triggers) {
+  const words = text.split(/\s+/);
+  const stripped = words
+    .map((w) => (w.length > 2 && HEB_PREFIX_RE.test(w) ? w.slice(1) : w))
+    .join(' ');
+  return triggers.some((t) => text.includes(t) || stripped.includes(t));
+}
+
+// ===================== Intent Dictionary =====================
+
+const INTENT_SUMMARY = [
+  'סיכום', 'דוח', 'דו"ח', 'כמה הוצאתי', 'סטטוס',
+  'summary', 'report', 'כמה בזבזתי',
+];
+const INTENT_UNDO = ['מחק', 'ביטול', 'טעות', 'undo', 'מחיקה', 'תמחק'];
+const INTENT_POLITENESS = ['תודה', 'מעולה', 'אחלה', 'יופי', 'thanks', 'great'];
+const INTENT_GREETING = ['היי', 'שלום', 'הלו', 'hi', 'hello', 'בוקר טוב', 'ערב טוב'];
+const INTENT_STATS = ['סטטיסטיקה', 'נתונים', 'הכי יקרה', 'stats', 'ניתוח'];
+const INTENT_CATEGORIES = ['קטגוריות', 'רשימה', 'categories'];
+const INTENT_BUDGET = ['יעד', 'תקציב', 'budget'];
+const INTENT_NOT_SUBMITTED = ['מה לא הוגש', 'לא הוגש', 'פתוחות', 'unsubmitted'];
+const INTENT_MARK_SUBMITTED = ['הגשתי', 'הוגש', 'submitted'];
+const INTENT_CONFIRM_YES = ['כן', 'yes', 'כ', 'בטוח', 'נכון'];
+const INTENT_CONFIRM_NO = ['לא', 'no', 'ל'];
+
+const CURRENCY_RE = /[$€]|דולר|אירו|euro|dollar/i;
 
 // ===================== Category Mapping =====================
 
@@ -97,10 +127,34 @@ const DEFAULT_CATEGORY = 'החזרי הוצאות שונות 🧑‍💻';
 function matchCategory(description) {
   if (!description) return DEFAULT_CATEGORY;
   const lower = description.toLowerCase();
+  const stripped = lower
+    .split(/\s+/)
+    .map((w) => (w.length > 2 && HEB_PREFIX_RE.test(w) ? w.slice(1) : w))
+    .join(' ');
   for (const { keywords, category } of CATEGORY_MAP) {
-    if (keywords.some((kw) => lower.includes(kw))) return category;
+    if (keywords.some((kw) => lower.includes(kw) || stripped.includes(kw))) {
+      return category;
+    }
   }
   return DEFAULT_CATEGORY;
+}
+
+function categoryEmoji(description) {
+  const cat = matchCategory(description);
+  const m = cat.match(/\p{Emoji_Presentation}/u);
+  return m ? m[0] : '';
+}
+
+// ===================== Description Sanitization =====================
+
+const NOISE_WORDS = new Set([
+  'בערך', 'שילמתי', 'הוצאתי', 'יצא', 'קניתי', 'היה',
+  'שקל', 'שקלים', 'ש"ח', 'על', 'עבור', 'בשביל', 'את', 'של',
+  'לי', 'כמו', 'זה', 'היום', 'אתמול', 'עכשיו',
+]);
+
+function sanitizeDescription(text) {
+  return text.split(/\s+/).filter((w) => !NOISE_WORDS.has(w)).join(' ').trim();
 }
 
 // ===================== Message Parsing =====================
@@ -109,10 +163,10 @@ function parseExpenseMessage(text) {
   if (!text || typeof text !== 'string') return { amount: 0, description: '' };
   const trimmed = text.trim();
   const m = trimmed.match(/\d+(?:[.,]\d+)?/);
-  if (!m) return { amount: 0, description: trimmed };
+  if (!m) return { amount: 0, description: sanitizeDescription(trimmed) };
   const amount = parseFloat(m[0].replace(',', '.')) || 0;
-  const description = trimmed.replace(m[0], '').replace(/\s+/g, ' ').trim();
-  return { amount, description };
+  const rawDesc = trimmed.replace(m[0], '').replace(/\s+/g, ' ').trim();
+  return { amount, description: sanitizeDescription(rawDesc) };
 }
 
 // ===================== TwiML =====================
@@ -136,30 +190,53 @@ function sendTwiML(res, messageText) {
 
 // ===================== Google Sheets =====================
 
-const SHEET_HEADERS = ['Date', 'Description', 'Amount', 'Category'];
+const SHEET_HEADERS = ['Date', 'Description', 'Amount', 'Category', 'Receipt', 'Submitted'];
+
+async function ensureHeaders(sheet) {
+  await sheet.loadHeaderRow(1);
+  const headers = sheet.headerValues || [];
+  const hasAll =
+    headers.length >= 6 &&
+    headers[0] === 'Date' &&
+    headers[4] === 'Receipt' &&
+    headers[5] === 'Submitted';
+  if (!hasAll && headers.filter(Boolean).length === 0) {
+    await sheet.setHeaderRow(SHEET_HEADERS);
+  }
+}
+
+function getCol(row, col) {
+  return (typeof row.get === 'function' ? row.get(col) : row[col]) || '';
+}
 
 async function appendExpenseRow(description, amount, category) {
   const doc = await getSpreadsheetDoc();
   if (!doc) return null;
   const sheet = doc.sheetsByIndex[0];
-  await sheet.loadHeaderRow(1);
-  const headers = sheet.headerValues || [];
-  const hasHeaders =
-    headers.length >= 4 &&
-    headers[0] === 'Date' &&
-    headers[1] === 'Description' &&
-    headers[2] === 'Amount' &&
-    headers[3] === 'Category';
-  if (!hasHeaders && headers.filter(Boolean).length === 0) {
-    await sheet.setHeaderRow(SHEET_HEADERS);
-  }
+  await ensureHeaders(sheet);
   const row = await sheet.addRow({
     Date: new Date().toISOString(),
     Description: description,
     Amount: amount,
     Category: category,
+    Receipt: '',
+    Submitted: 'No',
   });
   return row;
+}
+
+async function updateRowField(row, field, value) {
+  if (!row) return;
+  try {
+    if (typeof row.set === 'function') {
+      row.set(field, value);
+    } else {
+      row[field] = value;
+    }
+    await row.save();
+  } catch (e) {
+    console.error(`[sheets] update ${field} failed:`, e.message);
+  }
 }
 
 async function deleteRow(row) {
@@ -174,28 +251,119 @@ async function deleteRow(row) {
 }
 
 async function saveToSheet(description, amount, category) {
-  return appendExpenseRow(
-    description,
-    parseFloat(amount) || 0,
-    category || DEFAULT_CATEGORY
-  );
+  return appendExpenseRow(description, parseFloat(amount) || 0, category || DEFAULT_CATEGORY);
+}
+
+/** Generic: get parsed rows for a given year/month, with optional raw row refs */
+async function getRowsForMonth(targetYear, targetMonth, includeRaw) {
+  const doc = await getSpreadsheetDoc();
+  if (!doc) return null;
+  const sheet = doc.sheetsByIndex[0];
+  await ensureHeaders(sheet);
+  const allRows = await sheet.getRows();
+
+  const rows = [];
+  for (const row of allRows) {
+    const d = new Date(getCol(row, 'Date'));
+    if (d.getFullYear() !== targetYear || d.getMonth() !== targetMonth) continue;
+    const amt = parseFloat(getCol(row, 'Amount'));
+    if (Number.isNaN(amt) || amt === 0) continue;
+    const entry = {
+      amt,
+      cat: getCol(row, 'Category') || DEFAULT_CATEGORY,
+      desc: getCol(row, 'Description'),
+      receipt: getCol(row, 'Receipt'),
+      submitted: getCol(row, 'Submitted'),
+    };
+    if (includeRaw) entry.row = row;
+    rows.push(entry);
+  }
+  return rows;
+}
+
+async function getCurrentMonthRows(includeRaw) {
+  const now = new Date();
+  const rows = await getRowsForMonth(now.getFullYear(), now.getMonth(), includeRaw);
+  return rows
+    ? { rows, curYear: now.getFullYear(), curMonth: now.getMonth() }
+    : null;
 }
 
 async function sumAmountColumn() {
   const doc = await getSpreadsheetDoc();
   if (!doc) return 0;
   const sheet = doc.sheetsByIndex[0];
-  await sheet.loadHeaderRow(1);
+  await ensureHeaders(sheet);
   const rows = await sheet.getRows();
   let total = 0;
   for (const row of rows) {
-    const raw =
-      typeof row.get === 'function' ? row.get('Amount') : row.Amount;
-    const n = parseFloat(raw);
+    const n = parseFloat(getCol(row, 'Amount'));
     if (!Number.isNaN(n)) total += n;
   }
   return total;
 }
+
+// ===================== Submission & Receipt Logic =====================
+
+async function getUnsubmittedRows() {
+  const data = await getCurrentMonthRows(false);
+  if (!data) return [];
+  return data.rows.filter((r) => r.submitted !== 'Yes');
+}
+
+async function markAllCurrentMonthSubmitted() {
+  const data = await getCurrentMonthRows(true);
+  if (!data) return 0;
+  let count = 0;
+  for (const entry of data.rows) {
+    if (entry.submitted !== 'Yes' && entry.row) {
+      await updateRowField(entry.row, 'Submitted', 'Yes');
+      count++;
+    }
+  }
+  return count;
+}
+
+async function getMissingReceiptRows() {
+  const data = await getCurrentMonthRows(false);
+  if (!data) return [];
+  return data.rows.filter((r) => r.receipt !== 'Yes');
+}
+
+// ===================== MoM Helpers =====================
+
+function buildCategoryTotals(rows) {
+  const totals = new Map();
+  for (const { amt, cat } of rows) {
+    totals.set(cat, (totals.get(cat) || 0) + amt);
+  }
+  return totals;
+}
+
+function momLine(curTotals, prevTotals) {
+  if (prevTotals.size === 0) return '';
+  const lines = [];
+  for (const [cat, curAmt] of curTotals) {
+    const prevAmt = prevTotals.get(cat);
+    if (!prevAmt) continue;
+    const diff = Math.round(((curAmt - prevAmt) / prevAmt) * 100);
+    if (diff === 0) continue;
+    const direction = diff > 0 ? 'יותר' : 'פחות';
+    lines.push(`החודש הוצאת *${Math.abs(diff)}%* ${direction} על ${cat} לעומת החודש הקודם.`);
+  }
+  return lines.length > 0 ? lines.join('\n') : '';
+}
+
+async function getPrevMonthTotals() {
+  const now = new Date();
+  let y = now.getFullYear();
+  let m = now.getMonth() - 1;
+  if (m < 0) { m = 11; y--; }
+  const rows = await getRowsForMonth(y, m, false);
+  return rows ? buildCategoryTotals(rows) : new Map();
+}
+
+// ===================== Summary & Stats =====================
 
 const HEB_MONTHS = [
   'ינואר', 'פברואר', 'מרץ', 'אפריל', 'מאי', 'יוני',
@@ -209,46 +377,26 @@ const SUMMARY_FOOTERS = [
 ];
 
 async function buildMonthlySummary() {
-  const doc = await getSpreadsheetDoc();
-  if (!doc) return null;
-  const sheet = doc.sheetsByIndex[0];
-  await sheet.loadHeaderRow(1);
-  const rows = await sheet.getRows();
-
-  const now = new Date();
-  const curYear = now.getFullYear();
-  const curMonth = now.getMonth();
+  const data = await getCurrentMonthRows(false);
+  if (!data) return null;
+  const { rows, curMonth } = data;
   const monthName = HEB_MONTHS[curMonth];
+
+  if (rows.length === 0) {
+    return 'עדיין אין הוצאות רשומות לחודש זה. רוצה לרשום משהו עכשיו? ✍️';
+  }
 
   const categoryTotals = new Map();
   const categoryItems = new Map();
+  let noReceipt = 0;
+  let notSubmitted = 0;
 
-  for (const row of rows) {
-    const dateStr =
-      typeof row.get === 'function' ? row.get('Date') : row.Date;
-    const d = new Date(dateStr);
-    if (d.getFullYear() !== curYear || d.getMonth() !== curMonth) continue;
-
-    const amt = parseFloat(
-      typeof row.get === 'function' ? row.get('Amount') : row.Amount
-    );
-    if (Number.isNaN(amt) || amt === 0) continue;
-
-    const cat =
-      (typeof row.get === 'function' ? row.get('Category') : row.Category) ||
-      DEFAULT_CATEGORY;
-    const desc =
-      (typeof row.get === 'function'
-        ? row.get('Description')
-        : row.Description) || '';
-
-    categoryTotals.set(cat, (categoryTotals.get(cat) || 0) + amt);
-    if (!categoryItems.has(cat)) categoryItems.set(cat, []);
-    categoryItems.get(cat).push({ desc, amt });
-  }
-
-  if (categoryTotals.size === 0) {
-    return 'עדיין אין הוצאות רשומות לחודש זה. רוצה לרשום משהו עכשיו? ✍️';
+  for (const r of rows) {
+    categoryTotals.set(r.cat, (categoryTotals.get(r.cat) || 0) + r.amt);
+    if (!categoryItems.has(r.cat)) categoryItems.set(r.cat, []);
+    categoryItems.get(r.cat).push({ desc: r.desc, amt: r.amt });
+    if (r.receipt !== 'Yes') noReceipt++;
+    if (r.submitted !== 'Yes') notSubmitted++;
   }
 
   let grandTotal = 0;
@@ -273,8 +421,71 @@ async function buildMonthlySummary() {
 
   lines.push('─────────────────────');
   lines.push(`💰 *סה"כ מצטבר להחזר: ${grandTotal} ₪*`);
+
+  // MoM
+  try {
+    const prevTotals = await getPrevMonthTotals();
+    const mom = momLine(categoryTotals, prevTotals);
+    if (mom) { lines.push(''); lines.push(mom); }
+  } catch (e) {
+    console.error('[sheets] MoM failed:', e.message);
+  }
+
+  // Audit status
+  lines.push('');
+  if (noReceipt > 0) lines.push(`⚠️ ${noReceipt} הוצאות ללא קבלה`);
+  if (notSubmitted > 0) lines.push(`📝 ${notSubmitted} הוצאות טרם הוגשו`);
+
   lines.push('');
   lines.push(SUMMARY_FOOTERS[Math.floor(Math.random() * SUMMARY_FOOTERS.length)]);
+
+  return lines.join('\n');
+}
+
+async function buildMonthlyStats() {
+  const data = await getCurrentMonthRows(false);
+  if (!data) return null;
+  const { rows, curMonth } = data;
+  const monthName = HEB_MONTHS[curMonth];
+
+  if (rows.length === 0) {
+    return 'עדיין אין מספיק נתונים לניתוח. רשום הוצאות ונסה שוב! 📈';
+  }
+
+  const categoryTotals = buildCategoryTotals(rows);
+  let grandTotal = 0;
+  for (const v of categoryTotals.values()) grandTotal += v;
+
+  const sorted = [...categoryTotals.entries()].sort((a, b) => b[1] - a[1]);
+  const [topCat, topAmt] = sorted[0];
+  const topPct = grandTotal > 0 ? Math.round((topAmt / grandTotal) * 100) : 0;
+
+  const lines = [];
+  lines.push(`📊 *ניתוח הוצאות חודשי - ${monthName}*`);
+  lines.push('─────────────────────');
+  lines.push(`הקטגוריה הכי יקרה שלך היא *${topCat}* עם סכום של *${topAmt} ₪*.`);
+  lines.push(`זה מהווה *${topPct}%* מכלל ההוצאות שלך החודש.`);
+  lines.push('');
+  lines.push(`סה"כ ${rows.length} רישומים | *${grandTotal} ₪* סך הכל`);
+
+  if (sorted.length > 1) {
+    lines.push('');
+    lines.push('*פירוט לפי קטגוריה:*');
+    for (const [cat, amt] of sorted) {
+      const pct = Math.round((amt / grandTotal) * 100);
+      const bar = '█'.repeat(Math.max(1, Math.round(pct / 5)));
+      lines.push(`${bar} ${cat}: ${amt} ₪ (${pct}%)`);
+    }
+  }
+
+  // MoM
+  try {
+    const prevTotals = await getPrevMonthTotals();
+    const mom = momLine(categoryTotals, prevTotals);
+    if (mom) { lines.push(''); lines.push('*השוואה לחודש קודם:*'); lines.push(mom); }
+  } catch (e) {
+    console.error('[sheets] MoM failed:', e.message);
+  }
 
   return lines.join('\n');
 }
@@ -306,11 +517,9 @@ const UNDO_TTL_MS = 5 * 60 * 1000;
 const DAILY_PROMPT_TTL_MS = 4 * 60 * 60 * 1000;
 
 /**
- * Per-user session. States:
- *   IDLE                  — default, no pending interaction
- *   AWAITING_DESCRIPTION  — got a number-only message, waiting for description text
- *   AWAITING_HIGH_CONFIRM — amount > 2000, waiting for כן/לא
- *   AWAITING_DAILY_REPLY  — cron sent daily prompt, waiting for כן/לא
+ * States:
+ *   IDLE, AWAITING_DESCRIPTION, AWAITING_AMOUNT, AWAITING_HIGH_CONFIRM,
+ *   AWAITING_RECEIPT, AWAITING_DAILY_REPLY
  */
 const sessions = new Map();
 
@@ -322,7 +531,13 @@ function getSession(phone) {
 }
 
 function resetSession(phone) {
-  sessions.set(phone, { state: 'IDLE', ts: Date.now() });
+  const prev = sessions.get(phone);
+  const carry = {};
+  if (prev && prev.lastRow) {
+    carry.lastRow = prev.lastRow;
+    carry.lastRowTs = prev.lastRowTs;
+  }
+  sessions.set(phone, { state: 'IDLE', ts: Date.now(), ...carry });
 }
 
 function isSessionExpired(session) {
@@ -334,41 +549,87 @@ function isSessionExpired(session) {
 }
 
 function canUndo(session) {
-  return (
-    session.lastRow &&
-    session.lastRowTs &&
-    Date.now() - session.lastRowTs < UNDO_TTL_MS
-  );
+  return session.lastRow && session.lastRowTs && Date.now() - session.lastRowTs < UNDO_TTL_MS;
 }
 
 function confirmationMsg(amount, desc, category) {
   return (
     `רשמתי לי 🙂 *${amount} ₪* עבור *${desc}*.\n` +
     `זה נכנס תחת ${category}.\n\n` +
-    `לביטול הרישום, השב *"מחק"*`
+    `האם יש לך צילום של הקבלה? (כן / לא)`
+  );
+}
+
+async function saveAndConfirm(res, phone, amount, desc, category) {
+  if (amount > HIGH_AMOUNT_THRESHOLD) {
+    const s = getSession(phone);
+    s.state = 'AWAITING_HIGH_CONFIRM';
+    s.pendingAmount = amount;
+    s.pendingDesc = desc;
+    s.pendingCategory = category;
+    s.ts = Date.now();
+    sendTwiML(res, `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`);
+    return;
+  }
+
+  try {
+    const row = await appendExpenseRow(desc, amount, category);
+    const s = getSession(phone);
+    s.lastRow = row;
+    s.lastRowTs = Date.now();
+    s.state = 'AWAITING_RECEIPT';
+    s.receiptRow = row;
+    s.ts = Date.now();
+    sendTwiML(res, confirmationMsg(amount, desc, category));
+  } catch (e) {
+    console.error('[sheets] append failed:', e.message);
+    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+  }
+}
+
+// ===================== Response Templates =====================
+
+function buildCategoriesList() {
+  const lines = ['📋 *רשימת הקטגוריות:*', ''];
+  for (const { keywords, category } of CATEGORY_MAP) {
+    lines.push(`• ${category} — מילות מפתח: ${keywords.join(', ')}`);
+  }
+  lines.push(`• ${DEFAULT_CATEGORY} — ברירת מחדל`);
+  lines.push('');
+  lines.push('שלח הוצאה עם מילת מפתח ואני אסווג אוטומטית!');
+  return lines.join('\n');
+}
+
+function buildGreeting() {
+  return (
+    'היי! 👋 אני הבוט שלך לניהול החזרי הוצאות.\n\n' +
+    '*פקודות עיקריות:*\n' +
+    '• *סכום + תיאור* — רישום הוצאה (למשל: *150 דלק*)\n' +
+    '• *"סיכום"* — דוח חודשי מלא\n' +
+    '• *"סטטיסטיקה"* — ניתוח הוצאות\n' +
+    '• *"קטגוריות"* — רשימת קטגוריות\n' +
+    '• *"מחק"* — ביטול רישום אחרון\n\n' +
+    '*מעקב הגשה:*\n' +
+    '• *"מה לא הוגש"* — רשימת הוצאות פתוחות\n' +
+    '• *"הגשתי"* — סימון הכל כהוגש\n\n' +
+    'בואו נתחיל! 💪'
   );
 }
 
 // ===================== Config Log =====================
 
 function logConfigOnce() {
-  console.log(
-    '[config] TWILIO_ACCOUNT_SID:',
-    TWILIO_ACCOUNT_SID ? `${TWILIO_ACCOUNT_SID.slice(0, 6)}…` : '(missing)'
-  );
+  console.log('[config] TWILIO_ACCOUNT_SID:', TWILIO_ACCOUNT_SID ? `${TWILIO_ACCOUNT_SID.slice(0, 6)}…` : '(missing)');
   console.log('[config] TWILIO_AUTH_TOKEN:', TWILIO_AUTH_TOKEN ? '(set)' : '(missing)');
   console.log('[config] FROM_WHATSAPP_NUMBER:', FROM_WHATSAPP_NUMBER || '(missing)');
   console.log('[config] TO_WHATSAPP_NUMBER:', TO_WHATSAPP_NUMBER || '(missing)');
   console.log('[config] GOOGLE_SHEET_ID:', GOOGLE_SHEET_ID || '(missing)');
   const localCredsPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
   const credsSource = serviceAccountCreds
-    ? fs.existsSync(localCredsPath)
-      ? 'Expense-Tracker-Bot.json (Secret File / local)'
-      : 'GOOGLE_SERVICE_ACCOUNT_JSON (env)'
-    : '(missing — add Expense-Tracker-Bot.json Secret File or env)';
+    ? fs.existsSync(localCredsPath) ? 'Expense-Tracker-Bot.json' : 'GOOGLE_SERVICE_ACCOUNT_JSON (env)'
+    : '(missing)';
   console.log('[config] Google Service Account:', credsSource);
-  console.log('[config] Twilio client:', twilioClient ? 'ready' : '(disabled — missing SID/token)');
-  console.log('[config] HIGH_AMOUNT_THRESHOLD:', HIGH_AMOUNT_THRESHOLD, '₪');
+  console.log('[config] Twilio client:', twilioClient ? 'ready' : '(disabled)');
 }
 logConfigOnce();
 
@@ -386,37 +647,33 @@ app.post('/whatsapp', async (req, res) => {
   const phone = from.replace('whatsapp:', '');
   const session = getSession(phone);
 
-  // Expire stale sessions
   if (session.state !== 'IDLE' && isSessionExpired(session)) {
+    if (session.state === 'AWAITING_RECEIPT' && session.receiptRow) {
+      await updateRowField(session.receiptRow, 'Receipt', 'No');
+    }
     resetSession(phone);
-    session.state = 'IDLE';
   }
 
-  // ─── 1. UNDO (מחק) ───
-  if (lower === 'מחק' || lower === 'undo') {
-    if (canUndo(session)) {
-      const ok = await deleteRow(session.lastRow);
-      session.lastRow = null;
-      session.lastRowTs = null;
-      if (ok) {
-        sendTwiML(res, '✓ הרישום האחרון בוטל בהצלחה.');
-      } else {
-        sendTwiML(res, 'לא הצלחתי למחוק, נסה שוב.');
-      }
+  // ─── UNDO ───
+  if (matchesAny(lower, INTENT_UNDO)) {
+    if (canUndo(getSession(phone))) {
+      const s = getSession(phone);
+      const ok = await deleteRow(s.lastRow);
+      s.lastRow = null;
+      s.lastRowTs = null;
+      sendTwiML(res, ok ? '✓ הרישום האחרון בוטל בהצלחה.' : 'לא הצלחתי למחוק, נסה שוב.');
     } else {
       sendTwiML(res, 'אין רישום אחרון לביטול (או שעבר יותר מ-5 דקות).');
     }
     return;
   }
 
-  // ─── 2. SUMMARY (סיכום) ───
-  if (lower === 'summary' || lower === 'סיכום') {
+  // ─── SUMMARY ───
+  if (matchesAny(lower, INTENT_SUMMARY)) {
     let responseText;
     try {
       responseText = await buildMonthlySummary();
-      if (!responseText) {
-        responseText = `סה״כ הוצאות: ${await sumAmountColumn()} ₪`;
-      }
+      if (!responseText) responseText = `סה״כ הוצאות: ${await sumAmountColumn()} ₪`;
     } catch (e) {
       console.error('[sheets] summary failed:', e.message);
       responseText = 'לא הצלחתי לשלוף סיכום, נסה שוב';
@@ -425,73 +682,179 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  // ─── 3. AWAITING_DAILY_REPLY (כן / לא after cron prompt) ───
-  if (session.state === 'AWAITING_DAILY_REPLY') {
+  // ─── STATS ───
+  if (matchesAny(lower, INTENT_STATS)) {
+    let responseText;
+    try {
+      responseText = await buildMonthlyStats();
+      if (!responseText) responseText = 'לא הצלחתי לשלוף נתונים, נסה שוב';
+    } catch (e) {
+      console.error('[sheets] stats failed:', e.message);
+      responseText = 'לא הצלחתי לשלוף נתונים, נסה שוב';
+    }
+    sendTwiML(res, responseText);
+    return;
+  }
+
+  // ─── NOT SUBMITTED (מה לא הוגש) ───
+  if (matchesAny(lower, INTENT_NOT_SUBMITTED)) {
+    try {
+      const open = await getUnsubmittedRows();
+      if (open.length === 0) {
+        sendTwiML(res, '✅ כל ההוצאות החודש הוגשו! אין פריטים פתוחים.');
+      } else {
+        const total = open.reduce((s, r) => s + r.amt, 0);
+        const lines = [`📝 *${open.length} הוצאות טרם הוגשו (${total} ₪):*`, ''];
+        for (const r of open) {
+          const rcpt = r.receipt === 'Yes' ? '✅' : '❌';
+          lines.push(`• ${r.desc} — *${r.amt} ₪* (${r.cat}) | קבלה: ${rcpt}`);
+        }
+        lines.push('');
+        lines.push('שלח *"הגשתי"* כדי לסמן הכל כהוגש.');
+        sendTwiML(res, lines.join('\n'));
+      }
+    } catch (e) {
+      console.error('[sheets] unsubmitted failed:', e.message);
+      sendTwiML(res, 'לא הצלחתי לשלוף נתונים, נסה שוב');
+    }
+    return;
+  }
+
+  // ─── MARK SUBMITTED (הגשתי) ───
+  if (matchesAny(lower, INTENT_MARK_SUBMITTED)) {
+    try {
+      const count = await markAllCurrentMonthSubmitted();
+      if (count === 0) {
+        sendTwiML(res, '✅ כל ההוצאות כבר מסומנות כהוגשו!');
+      } else {
+        sendTwiML(res, `מעולה! *${count}* הוצאות החודש סומנו כהוגשו. 💰`);
+      }
+    } catch (e) {
+      console.error('[sheets] mark submitted failed:', e.message);
+      sendTwiML(res, 'שגיאה בעדכון, נסה שוב');
+    }
+    return;
+  }
+
+  // ─── CATEGORIES LIST ───
+  if (matchesAny(lower, INTENT_CATEGORIES)) {
+    sendTwiML(res, buildCategoriesList());
+    return;
+  }
+
+  // ─── BUDGET ───
+  if (matchesAny(lower, INTENT_BUDGET)) {
+    try {
+      const data = await getCurrentMonthRows(false);
+      if (data && data.rows.length > 0) {
+        const total = data.rows.reduce((s, r) => s + r.amt, 0);
+        sendTwiML(res,
+          `📈 סה"כ הוצאות החודש: *${total} ₪*\n(${data.rows.length} רישומים)\n\nשלח *"סיכום"* לדוח מלא`
+        );
+      } else {
+        sendTwiML(res, 'עדיין אין הוצאות החודש. רשום הוצאה ונסה שוב!');
+      }
+    } catch (e) {
+      console.error('[sheets] budget failed:', e.message);
+      sendTwiML(res, 'לא הצלחתי לשלוף נתונים, נסה שוב');
+    }
+    return;
+  }
+
+  // ─── GREETING ───
+  if (matchesAny(lower, INTENT_GREETING) && !lower.match(/\d/)) {
+    sendTwiML(res, buildGreeting());
+    return;
+  }
+
+  // ─── POLITENESS ───
+  if (matchesAny(lower, INTENT_POLITENESS)) {
+    sendTwiML(res, 'בשמחה! 😊 תכתוב *"סיכום"* כדי לראות את המצב החודשי.');
+    return;
+  }
+
+  // ─── SESSION STATES ───
+
+  // AWAITING_RECEIPT
+  if (getSession(phone).state === 'AWAITING_RECEIPT') {
+    const s = getSession(phone);
+    const receiptRow = s.receiptRow;
+    if (matchesAny(lower, INTENT_CONFIRM_YES)) {
+      await updateRowField(receiptRow, 'Receipt', 'Yes');
+      resetSession(phone);
+      sendTwiML(res, '✅ מעולה, קבלה מאושרת!\nלביטול הרישום, השב *"מחק"*');
+      return;
+    }
+    if (matchesAny(lower, INTENT_CONFIRM_NO)) {
+      await updateRowField(receiptRow, 'Receipt', 'No');
+      resetSession(phone);
+      sendTwiML(res, '📌 תזכורת: נסה לשמור את הקבלה לצורך ההחזר.\nלביטול הרישום, השב *"מחק"*');
+      return;
+    }
+    // Any other message — default Receipt to No and process normally
+    await updateRowField(receiptRow, 'Receipt', 'No');
     resetSession(phone);
-    if (['כן', 'yes', 'כ'].includes(lower)) {
+    // Fall through to normal parsing
+  }
+
+  // AWAITING_DAILY_REPLY
+  if (getSession(phone).state === 'AWAITING_DAILY_REPLY') {
+    resetSession(phone);
+    if (matchesAny(lower, INTENT_CONFIRM_YES)) {
       sendTwiML(res, 'מעולה! שלח לי את ההוצאות ואני ארשום 📝');
       return;
     }
-    if (['לא', 'no', 'ל'].includes(lower)) {
+    if (matchesAny(lower, INTENT_CONFIRM_NO)) {
       sendTwiML(res, 'יופי, ערב טוב! 🌙');
       return;
     }
-    // Not yes/no — fall through to normal parsing
   }
 
-  // ─── 4. AWAITING_DESCRIPTION (user sent number only, now sending description) ───
-  if (session.state === 'AWAITING_DESCRIPTION') {
-    const pendingAmount = session.pendingAmount;
-    const desc = trimmed || '(ללא תיאור)';
-    const category = matchCategory(desc);
-
-    // If user sends another number instead of description, treat as new expense
+  // AWAITING_DESCRIPTION
+  if (getSession(phone).state === 'AWAITING_DESCRIPTION') {
+    const s = getSession(phone);
+    const pendingAmount = s.pendingAmount;
     const parsed = parseExpenseMessage(trimmed);
     if (parsed.amount && parsed.description) {
       resetSession(phone);
-      // Fall through — will be handled below as a normal expense
     } else {
+      const desc = sanitizeDescription(trimmed) || '(ללא תיאור)';
+      const category = matchCategory(desc);
       resetSession(phone);
-
-      if (pendingAmount > HIGH_AMOUNT_THRESHOLD) {
-        const s = getSession(phone);
-        s.state = 'AWAITING_HIGH_CONFIRM';
-        s.pendingAmount = pendingAmount;
-        s.pendingDesc = desc;
-        s.pendingCategory = category;
-        s.ts = Date.now();
-        sendTwiML(
-          res,
-          `זה סכום גבוה מהרגיל (*${pendingAmount} ₪*), אתה בטוח שזה נכון? (כן / לא)`
-        );
-        return;
-      }
-
-      try {
-        const row = await appendExpenseRow(desc, pendingAmount, category);
-        const s = getSession(phone);
-        s.lastRow = row;
-        s.lastRowTs = Date.now();
-        sendTwiML(res, confirmationMsg(pendingAmount, desc, category));
-      } catch (e) {
-        console.error('[sheets] append failed:', e.message);
-        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-      }
+      await saveAndConfirm(res, phone, pendingAmount, desc, category);
       return;
     }
   }
 
-  // ─── 5. AWAITING_HIGH_CONFIRM (כן / לא for high amount) ───
-  if (session.state === 'AWAITING_HIGH_CONFIRM') {
-    const { pendingAmount, pendingDesc, pendingCategory } = session;
+  // AWAITING_AMOUNT
+  if (getSession(phone).state === 'AWAITING_AMOUNT') {
+    const s = getSession(phone);
+    const parsed = parseExpenseMessage(trimmed);
+    if (parsed.amount) {
+      const { pendingDesc, pendingCategory } = s;
+      resetSession(phone);
+      await saveAndConfirm(res, phone, parsed.amount, pendingDesc, pendingCategory);
+      return;
+    }
     resetSession(phone);
+    sendTwiML(res, 'לא הצלחתי לזהות סכום. נסה שוב עם מספר (למשל: *50*)');
+    return;
+  }
 
-    if (['כן', 'yes', 'כ'].includes(lower)) {
+  // AWAITING_HIGH_CONFIRM
+  if (getSession(phone).state === 'AWAITING_HIGH_CONFIRM') {
+    const s = getSession(phone);
+    const { pendingAmount, pendingDesc, pendingCategory } = s;
+    resetSession(phone);
+    if (matchesAny(lower, INTENT_CONFIRM_YES)) {
       try {
         const row = await appendExpenseRow(pendingDesc, pendingAmount, pendingCategory);
-        const s = getSession(phone);
-        s.lastRow = row;
-        s.lastRowTs = Date.now();
+        const ns = getSession(phone);
+        ns.lastRow = row;
+        ns.lastRowTs = Date.now();
+        ns.state = 'AWAITING_RECEIPT';
+        ns.receiptRow = row;
+        ns.ts = Date.now();
         sendTwiML(res, confirmationMsg(pendingAmount, pendingDesc, pendingCategory));
       } catch (e) {
         console.error('[sheets] append failed:', e.message);
@@ -499,26 +862,28 @@ app.post('/whatsapp', async (req, res) => {
       }
       return;
     }
-    if (['לא', 'no', 'ל'].includes(lower)) {
+    if (matchesAny(lower, INTENT_CONFIRM_NO)) {
       sendTwiML(res, 'בוטל ✓ הרישום לא נשמר.');
       return;
     }
-    // Not yes/no — fall through to normal parsing
   }
 
-  // ─── 6. NORMAL EXPENSE PARSING ───
-  const { amount, description } = parseExpenseMessage(trimmed);
-
-  if (!amount) {
-    sendTwiML(
-      res,
-      'כדי לרשום הוצאה, שלח מספר + תיאור.\nלדוגמה: *150 דלק*\nאו: *תספורת 50*'
-    );
+  // ─── CURRENCY ALERT ───
+  if (CURRENCY_RE.test(trimmed)) {
+    sendTwiML(res, '⚠️ שים לב — הבוט רושם הוצאות ב-₪ בלבד.\nאם הסכום בש"ח, שלח בלי סימן מטבע זר.');
     return;
   }
 
-  // Number only, no description → ask for description
-  if (!description) {
+  // ─── NORMAL EXPENSE PARSING ───
+  const { amount, description } = parseExpenseMessage(trimmed);
+
+  if (amount && description) {
+    const category = matchCategory(description);
+    await saveAndConfirm(res, phone, amount, description, category);
+    return;
+  }
+
+  if (amount && !description) {
     const s = getSession(phone);
     s.state = 'AWAITING_DESCRIPTION';
     s.pendingAmount = amount;
@@ -527,54 +892,29 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  const desc = description;
-  const category = matchCategory(desc);
-
-  // High amount validation
-  if (amount > HIGH_AMOUNT_THRESHOLD) {
+  if (!amount && description) {
+    const category = matchCategory(description);
+    const emoji = categoryEmoji(description);
     const s = getSession(phone);
-    s.state = 'AWAITING_HIGH_CONFIRM';
-    s.pendingAmount = amount;
-    s.pendingDesc = desc;
+    s.state = 'AWAITING_AMOUNT';
+    s.pendingDesc = description;
     s.pendingCategory = category;
     s.ts = Date.now();
-    sendTwiML(
-      res,
-      `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`
-    );
+    sendTwiML(res, `קיבלתי שזו הוצאה על ${description} ${emoji}. כמה זה עלה?`);
     return;
   }
 
-  // Normal save
-  try {
-    const row = await appendExpenseRow(desc, amount, category);
-    const s = getSession(phone);
-    s.lastRow = row;
-    s.lastRowTs = Date.now();
-    sendTwiML(res, confirmationMsg(amount, desc, category));
-  } catch (e) {
-    console.error('[sheets] append failed:', e.message);
-    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-  }
+  sendTwiML(res, 'לא הבנתי 🤔\nשלח *סכום + תיאור* (למשל: *150 דלק*)\nאו שלח *"שלום"* לרשימת הפקודות.');
 });
 
-/**
- * Webhook חלופי — אם יש ספרות בהודעה → שומר + מאשר;
- * אחרת → "קיבלתי ממך: …".
- */
 app.post('/webhook', async (req, res) => {
   try {
     const message = req.body.Body || '';
     const { amount, description } = parseExpenseMessage(message);
-
     if (amount) {
       const desc = description || '(ללא תיאור)';
       const category = matchCategory(description);
-      try {
-        await saveToSheet(desc, amount, category);
-      } catch (e) {
-        console.error('[webhook] sheets:', e.message);
-      }
+      try { await saveToSheet(desc, amount, category); } catch (e) { console.error('[webhook] sheets:', e.message); }
       sendTwiML(res, `רשמתי לי 🙂 *${amount} ₪* עבור *${desc}*. זה נכנס תחת ${category}.`);
     } else {
       sendTwiML(res, `קיבלתי ממך: ${message}`);
@@ -590,99 +930,93 @@ app.post('/webhook', async (req, res) => {
 const CRON_TZ = process.env.CRON_TZ || 'Asia/Jerusalem';
 
 if (TO_WHATSAPP_NUMBER && twilioClient) {
-  cron.schedule(
-    '0 20 * * *',
-    async () => {
-      console.log('[cron] Daily expense prompt');
-      const phone = TO_WHATSAPP_NUMBER.replace('whatsapp:', '');
-      const s = getSession(phone);
-      s.state = 'AWAITING_DAILY_REPLY';
-      s.ts = Date.now();
+  // Daily 20:00
+  cron.schedule('0 20 * * *', async () => {
+    console.log('[cron] Daily expense prompt');
+    const phone = TO_WHATSAPP_NUMBER.replace('whatsapp:', '');
+    const s = getSession(phone);
+    s.state = 'AWAITING_DAILY_REPLY';
+    s.ts = Date.now();
+    await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, 'היי! 👋 היו לך הוצאות היום? (כן / לא)');
+  }, { timezone: CRON_TZ });
+
+  // Sundays 10:00 — missing receipts reminder
+  cron.schedule('0 10 * * 0', async () => {
+    console.log('[cron] Missing receipts reminder');
+    try {
+      const missing = await getMissingReceiptRows();
+      if (missing.length === 0) return;
+      const lines = [`היי, רשמת *${missing.length}* הוצאות ללא אישור קבלה. הכל שמור? 📑`, ''];
+      for (const r of missing.slice(0, 10)) {
+        lines.push(`• ${r.desc} — *${r.amt} ₪*`);
+      }
+      if (missing.length > 10) lines.push(`...ועוד ${missing.length - 10}`);
+      await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, lines.join('\n'));
+    } catch (e) {
+      console.error('[cron] Missing receipts failed:', e.message);
+    }
+  }, { timezone: CRON_TZ });
+
+  // 25th 20:00 — deadline alert
+  cron.schedule('0 20 25 * *', async () => {
+    console.log('[cron] Deadline alert');
+    try {
+      const open = await getUnsubmittedRows();
+      if (open.length === 0) return;
+      const total = open.reduce((s, r) => s + r.amt, 0);
       await sendWhatsAppMessage(
         TO_WHATSAPP_NUMBER,
-        'היי! 👋 היו לך הוצאות היום? (כן / לא)'
+        `🚨 יום הגשת החזרים מתקרב!\nיש לך *${open.length}* הוצאות פתוחות בסך *${total} ₪* שטרם הוגשו.\nכדאי לסיים עם זה!\n\nשלח *"הגשתי"* לסמן הכל.`
       );
-    },
-    { timezone: CRON_TZ }
-  );
+    } catch (e) {
+      console.error('[cron] Deadline alert failed:', e.message);
+    }
+  }, { timezone: CRON_TZ });
 
-  cron.schedule(
-    '0 20 29 * *',
-    async () => {
-      console.log('[cron] Monthly report reminder');
-      await sendWhatsAppMessage(
-        TO_WHATSAPP_NUMBER,
-        'תזכורת חודשית 📋 הגיע הזמן להגיש דוחות!\nשלח *"סיכום"* לקבלת סה״כ ההוצאות.'
-      );
-    },
-    { timezone: CRON_TZ }
-  );
+  // Monthly 29th 20:00
+  cron.schedule('0 20 29 * *', async () => {
+    console.log('[cron] Monthly report reminder');
+    await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, 'תזכורת חודשית 📋 הגיע הזמן להגיש דוחות!\nשלח *"סיכום"* לקבלת סה״כ ההוצאות.');
+  }, { timezone: CRON_TZ });
 
-  console.log(`[cron] Scheduled: daily 20:00 + monthly 29th 20:00 (${CRON_TZ})`);
+  console.log(`[cron] Scheduled: daily 20:00, Sundays 10:00, 25th 20:00, 29th 20:00 (${CRON_TZ})`);
 } else {
-  console.log(
-    '[cron] Disabled — set TO_WHATSAPP_NUMBER + Twilio credentials to enable.'
-  );
+  console.log('[cron] Disabled — set TO_WHATSAPP_NUMBER + Twilio credentials to enable.');
 }
 
 // ===================== Server =====================
 
 const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 
-// --- Smoke tests (SMOKE_TEST=1) ---
 function runLocalUnitChecks() {
   console.log('\n=== [smoke] בדיקות יחידה ===');
   const a = parseExpenseMessage('hello');
   const b = parseExpenseMessage('150 דלק');
-  const c = parseExpenseMessage('קפה 12,30');
-  const d = parseExpenseMessage('42.5');
+  const c = parseExpenseMessage('הוצאתי 50 שקל על דלק');
   console.log('  parse("hello") →', JSON.stringify(a), a.amount === 0 ? '✓' : '✗');
   console.log('  parse("150 דלק") →', JSON.stringify(b), b.amount === 150 && b.description === 'דלק' ? '✓' : '✗');
-  console.log('  parse("קפה 12,30") →', JSON.stringify(c), c.amount === 12.3 && c.description === 'קפה' ? '✓' : '✗');
-  console.log('  parse("42.5") →', JSON.stringify(d), d.amount === 42.5 && d.description === '' ? '✓' : '✗');
+  console.log('  parse("הוצאתי 50 שקל על דלק") →', JSON.stringify(c), c.amount === 50 && c.description === 'דלק' ? '✓' : '✗');
 
   console.log('\n=== [smoke] קטגוריות ===');
-  const cats = [
-    ['פסיכולוג', 'החזרי פסיכולוג 🧘'],
-    ['תרופות מרקחת', 'החזרי בריאות 🩺'],
-    ['חנייה בעיר', 'החזרי חנייה 🅿️'],
-    ['אוטובוס', 'החזרי נסיעות תחבורה ציבורית 🚏'],
-    ['תספורת', 'החזרי תספורת וקוסמטיקה 💇'],
-    ['חוג ילדים', 'החזרי ילדים 👶'],
-    ['סלולר', 'החזרי טלפון 📱'],
-    ['אגרה', 'החזרי תשלומים ממשלתיים 👩‍⚖️'],
-    ['נעליים', 'החזרי ביגוד לעובדי חוץ 👕'],
-    ['ועד בית', 'החזרי בניין 🏡'],
-    ['מונית', 'החזרי מוניות 🚕'],
-    ['קפה', 'החזרי הוצאות שונות 🧑‍💻'],
-  ];
+  const cats = [['בחנייה', 'החזרי חנייה 🅿️'], ['למונית', 'החזרי מוניות 🚕']];
   for (const [desc, expected] of cats) {
     const got = matchCategory(desc);
-    console.log(`  category("${desc}") → ${got}`, got === expected ? '✓' : `✗ (expected: ${expected})`);
+    console.log(`  category("${desc}") → ${got}`, got === expected ? '✓' : `✗`);
   }
+
+  console.log('\n=== [smoke] intents ===');
+  console.log('  "הסיכום" → SUMMARY:', matchesAny('הסיכום', INTENT_SUMMARY) ? '✓' : '✗');
+  console.log('  "מה לא הוגש" → NOT_SUB:', matchesAny('מה לא הוגש', INTENT_NOT_SUBMITTED) ? '✓' : '✗');
+  console.log('  "הגשתי" → MARK_SUB:', matchesAny('הגשתי', INTENT_MARK_SUBMITTED) ? '✓' : '✗');
 }
 
 function postForm(port, urlPath, fields) {
   const body = new URLSearchParams(fields).toString();
   return new Promise((resolve, reject) => {
     const req = http.request(
-      {
-        hostname: '127.0.0.1',
-        port,
-        path: urlPath,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (ch) => {
-          data += ch;
-        });
-        res.on('end', () => resolve({ status: res.statusCode, body: data }));
-      }
+      { hostname: '127.0.0.1', port, path: urlPath, method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } },
+      (r) => { let d = ''; r.on('data', (c) => { d += c; }); r.on('end', () => resolve({ status: r.statusCode, body: d })); }
     );
     req.on('error', reject);
     req.write(body);
@@ -693,29 +1027,35 @@ function postForm(port, urlPath, fields) {
 async function runHttpSmokeTests(port) {
   console.log('\n=== [smoke] בדיקות HTTP ===');
   const F = TWILIO_FROM_TEST;
+  const strip = (b) => b.replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim().slice(0, 130);
 
   const cases = [
-    { name: 'ללא מספר → help', fields: { Body: 'שלום', From: F } },
-    { name: '150 דלק → save', fields: { Body: '150 דלק', From: F } },
-    { name: 'מחק → undo (no row)', fields: { Body: 'מחק', From: F } },
-    { name: 'תרופות 80 → save+cat', fields: { Body: 'תרופות 80', From: F } },
+    { name: 'greeting', fields: { Body: 'שלום', From: F } },
+    { name: '150 דלק → save+receipt', fields: { Body: '150 דלק', From: F } },
+    { name: 'כן → receipt yes', fields: { Body: 'כן', From: F } },
+    { name: 'תרופות 80 → save', fields: { Body: 'תרופות 80', From: F } },
+    { name: 'לא → receipt no', fields: { Body: 'לא', From: F } },
+    { name: 'מחק → undo', fields: { Body: 'מחק', From: F } },
     { name: '42 → ask desc', fields: { Body: '42', From: F } },
     { name: 'חניה → complete', fields: { Body: 'חניה', From: F } },
-    { name: '3000 דלק → high confirm', fields: { Body: '3000 דלק', From: F } },
+    { name: 'כן → receipt', fields: { Body: 'כן', From: F } },
+    { name: 'מונית → ask amt', fields: { Body: 'מונית', From: F } },
+    { name: '55 → complete', fields: { Body: '55', From: F } },
+    { name: 'לא → receipt', fields: { Body: 'לא', From: F } },
+    { name: '3000 דלק → high', fields: { Body: '3000 דלק', From: F } },
     { name: 'כן → confirm high', fields: { Body: 'כן', From: F } },
-    { name: 'סיכום → summary', fields: { Body: 'סיכום', From: F } },
-    { name: 'webhook 200 חנייה', path: '/webhook', fields: { Body: '200 חנייה', From: F } },
+    { name: 'כן → receipt', fields: { Body: 'כן', From: F } },
+    { name: 'מה לא הוגש', fields: { Body: 'מה לא הוגש', From: F } },
+    { name: 'הגשתי', fields: { Body: 'הגשתי', From: F } },
+    { name: 'סיכום', fields: { Body: 'סיכום', From: F } },
+    { name: 'סטטיסטיקה', fields: { Body: 'סטטיסטיקה', From: F } },
+    { name: '$50 → currency', fields: { Body: '$50 דלק', From: F } },
   ];
 
   for (const t of cases) {
     try {
       const { status, body } = await postForm(port, t.path || '/whatsapp', t.fields);
-      const text = body
-        .replace(/<[^>]+>/g, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 120);
-      console.log(`  [${t.name}] ${status} → ${text}${body.length > 120 ? '…' : ''}`);
+      console.log(`  [${t.name}] ${status} → ${strip(body)}${body.length > 130 ? '…' : ''}`);
     } catch (e) {
       console.error(`  [${t.name}] שגיאה:`, e.message);
     }
@@ -727,13 +1067,8 @@ if (process.env.SMOKE_TEST === '1') {
   runLocalUnitChecks();
   const server = app.listen(PORT, async () => {
     console.log(`[smoke] שרת זמני על פורט ${PORT}`);
-    try {
-      await runHttpSmokeTests(PORT);
-    } finally {
-      server.close(() => {
-        process.exit(0);
-      });
-    }
+    try { await runHttpSmokeTests(PORT); }
+    finally { server.close(() => { process.exit(0); }); }
   });
 } else {
   app.listen(PORT, () => {
