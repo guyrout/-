@@ -50,6 +50,14 @@ const twilioClient =
     ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     : null;
 
+/** WhatsApp Content API (quick-reply / list-picker); optional env overrides */
+let contentSidReceiptQr = (process.env.TWILIO_CONTENT_SID_RECEIPT_QR || '').trim();
+let contentSidCategoryList = (process.env.TWILIO_CONTENT_SID_CATEGORY_LIST || '').trim();
+/** v2: quick-reply titles סיכום חודשי 📊 / מחיקה 🗑️; bump if Twilio copy changes */
+const CONTENT_FN_RECEIPT_QR = 'expense_bot_receipt_success_qr_v2';
+const CONTENT_FN_CATEGORY_LIST = 'expense_bot_category_list_he_v2';
+let contentTemplatesInitPromise = null;
+
 function fmtWA(num) {
   return num.startsWith('whatsapp:') ? num : `whatsapp:${num}`;
 }
@@ -401,7 +409,20 @@ const CATEGORY_MAP = [
 ];
 
 const CLARIFY_CATEGORY_MSG =
-  'שמע, הקבלה אצלי אבל אני לא סגור על הקטגוריה. זה חניה? נסיעות? או משהו אחר? תכתוב לי מילה אחת שאדע לאן לשייך.';
+  '*בחר קטגוריה*\nשמע, הקבלה אצלי אבל לא נתפסתי לאן לשייך — כתוב מילה אחת: *חניה*, *נסיעות*, *אגרות*, *תקשורת* או *ציוד משרדי*. לא נותנים לכסף לברוח 🕵️‍♂️';
+
+/** List-picker / payload id → Sheet category (must match CANONICAL_CATEGORIES) */
+const LIST_ITEM_ID_TO_CATEGORY = {
+  CAT_PARKING: 'חניה',
+  CAT_TRAVEL: 'נסיעות',
+  CAT_TOLLS: 'אגרות',
+  CAT_COMMS: 'תקשורת',
+  CAT_OFFICE: 'ציוד משרדי',
+};
+
+/** Quick-reply button payloads (inbound ButtonPayload) */
+const QR_PAYLOAD_SUMMARY = 'btn_summary';
+const QR_PAYLOAD_UNDO_LAST = 'btn_undo_last';
 
 const CATEGORY_RETRY_MSG =
   'לא נתפסתי… נסה מילה אחת: *חניה*, *נסיעות*, *אגרות*, *תקשורת* או *ציוד משרדי* 🍺';
@@ -507,6 +528,7 @@ function resolveCategoryFromReply(text) {
   if (!text || typeof text !== 'string') return null;
   const trimmed = text.trim().replace(/\s+/g, ' ');
   if (!trimmed) return null;
+  if (LIST_ITEM_ID_TO_CATEGORY[trimmed]) return LIST_ITEM_ID_TO_CATEGORY[trimmed];
   const lower = trimmed.toLowerCase();
   const stripped = lower
     .split(/\s+/)
@@ -559,12 +581,29 @@ function confirmCategorySavedExact(category) {
   return `סגור, רשמתי תחת ${category}. תודה!`;
 }
 
-function startCategoryClarification(res, phone, pick) {
+async function startCategoryClarification(res, phone, pick, opts = {}) {
   const s = getSession(phone);
   s.state = 'AWAITING_CATEGORY_CLARIFICATION';
   s.pendingCategoryPick = pick;
   s.ts = Date.now();
-  sendTwiML(res, CLARIFY_CATEGORY_MSG);
+  const wa = opts.waNorm || '';
+  await ensureWhatsAppContentTemplates();
+
+  const sentList =
+    wa &&
+    contentSidCategoryList &&
+    (await sendWhatsAppContentMessage(wa, contentSidCategoryList, {}));
+
+  if (sentList) {
+    if (res && !res.headersSent) emptyTwiMLResponse(res);
+    return;
+  }
+
+  if (opts.useOutboundApi && wa) {
+    void replyWhatsAppToUser(wa, CLARIFY_CATEGORY_MSG);
+  } else if (res && !res.headersSent) {
+    sendTwiML(res, CLARIFY_CATEGORY_MSG);
+  }
 }
 
 // ===================== Description Sanitization =====================
@@ -638,6 +677,253 @@ function sendTwiMLMulti(res, parts) {
   const twiml = new MessagingResponse();
   for (const p of msgs) twiml.message(String(p));
   res.type('text/xml').send(twiml.toString());
+}
+
+/** Close webhook without sending a visible TwiML message; follow up via REST API. */
+function emptyTwiMLResponse(res) {
+  if (res.headersSent) return;
+  res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+}
+
+const MEDIA_PROCESSING_ACK_MSG =
+  'קיבלתי! רגע, אני מעלה את זה לדרייב ורושם לך הכל שלא ילך לאיבוד... 🕵️‍♂️';
+
+/** WhatsApp typing indicator (Twilio v2 beta). Requires inbound MessageSid / SmsSid. */
+async function sendWhatsAppTypingIndicator(messageSid) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !messageSid) return;
+  try {
+    await axios.post(
+      'https://messaging.twilio.com/v2/Indicators/Typing.json',
+      new URLSearchParams({ messageId: messageSid, channel: 'whatsapp' }).toString(),
+      {
+        auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 8000,
+      }
+    );
+  } catch (e) {
+    console.warn('[twilio] typing indicator:', e.response?.data || e.message);
+  }
+}
+
+/** Outbound reply to the user (same sender as the bot). Used after empty TwiML. */
+async function replyWhatsAppToUser(waNorm, body) {
+  if (!twilioClient || !FROM_WHATSAPP_NUMBER || !waNorm || body == null || body === '') return;
+  const to = waNorm.startsWith('whatsapp:') ? waNorm : fmtWA(waNorm);
+  try {
+    await twilioClient.messages.create({
+      from: fmtWA(FROM_WHATSAPP_NUMBER),
+      to,
+      body: String(body),
+    });
+    console.log('[whatsapp] outbound reply:', String(body).slice(0, 72));
+  } catch (e) {
+    console.error('[whatsapp] outbound reply failed:', e.message);
+  }
+}
+
+function clipWhatsAppButtonTitle(s, maxCp = 20) {
+  const cp = [...s];
+  if (cp.length <= maxCp) return s;
+  return cp.slice(0, Math.max(1, maxCp - 1)).join('') + '…';
+}
+
+function clipWhatsAppListField(s, max) {
+  const cp = [...s];
+  if (cp.length <= max) return s;
+  return cp.slice(0, Math.max(1, max - 1)).join('') + '…';
+}
+
+function categoryListPickerItems() {
+  const meta = {
+    חניה: 'חנייה, פנגו, חניון',
+    נסיעות: 'מונית, דלק, תחבורה',
+    אגרות: 'כביש, נתיב, חוצה ישראל',
+    תקשורת: 'סלולר, אינטרנט',
+    'ציוד משרדי': 'משרד, ציוד',
+  };
+  const idByCat = {
+    חניה: 'CAT_PARKING',
+    נסיעות: 'CAT_TRAVEL',
+    אגרות: 'CAT_TOLLS',
+    תקשורת: 'CAT_COMMS',
+    'ציוד משרדי': 'CAT_OFFICE',
+  };
+  return CANONICAL_CATEGORIES.map((cat) => ({
+    item: clipWhatsAppListField(cat, 24),
+    description: clipWhatsAppListField(meta[cat] || cat, 72),
+    id: idByCat[cat],
+  }));
+}
+
+async function twilioContentRequest(method, pathSuffix, data) {
+  const path = pathSuffix.startsWith('/') ? pathSuffix : `/${pathSuffix}`;
+  return axios({
+    method,
+    url: `https://content.twilio.com/v1${path}`,
+    auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+    headers: data ? { 'Content-Type': 'application/json' } : {},
+    data,
+    timeout: 20000,
+    validateStatus: () => true,
+  });
+}
+
+async function fetchContentFriendlyNameToSid() {
+  const map = new Map();
+  let nextPath = '/Content?PageSize=100';
+  for (let i = 0; i < 12 && nextPath; i++) {
+    const r = await twilioContentRequest('GET', nextPath);
+    if (r.status !== 200) {
+      console.warn('[twilio-content] list Content', r.status, JSON.stringify(r.data || {}).slice(0, 240));
+      break;
+    }
+    for (const c of r.data.contents || []) {
+      if (c.friendly_name && c.sid) map.set(c.friendly_name, c.sid);
+    }
+    const nextUrl = r.data.meta?.next_page_url || '';
+    nextPath = nextUrl ? nextUrl.replace(/^https:\/\/content\.twilio\.com\/v1/i, '') : '';
+  }
+  return map;
+}
+
+async function postTwilioContentTemplate(payload) {
+  const r = await twilioContentRequest('POST', '/Content', payload);
+  if (r.status === 200 || r.status === 201) return String(r.data?.sid || '').trim();
+  console.warn('[twilio-content] create template:', r.status, r.data);
+  return '';
+}
+
+async function createReceiptQuickReplyTemplate() {
+  const t1 = 'סיכום חודשי 📊';
+  const t2 = 'מחיקה 🗑️';
+  const payload = {
+    friendly_name: CONTENT_FN_RECEIPT_QR,
+    language: 'he',
+    variables: { 1: 'אישור רישום' },
+    types: {
+      'twilio/text': {
+        body: '{{1}}\n\n*מה הלאה?* סיכום חודשי או מחיקה — אפשר גם *סיכום* / *מחק*. החבר החכם כאן 🍺',
+      },
+      'twilio/quick-reply': {
+        body: '{{1}}\n\n*מה עושים עכשיו?* שתי הקשות למטה — או במילים, בלי בושה 🕵️‍♂️',
+        actions: [
+          { type: 'QUICK_REPLY', title: clipWhatsAppButtonTitle(t1, 20), id: QR_PAYLOAD_SUMMARY },
+          { type: 'QUICK_REPLY', title: clipWhatsAppButtonTitle(t2, 20), id: QR_PAYLOAD_UNDO_LAST },
+        ],
+      },
+    },
+  };
+  let sid = await postTwilioContentTemplate(payload);
+  if (!sid) {
+    const m = await fetchContentFriendlyNameToSid();
+    sid = m.get(CONTENT_FN_RECEIPT_QR) || '';
+  }
+  return sid;
+}
+
+async function createCategoryListTemplate() {
+  const payload = {
+    friendly_name: CONTENT_FN_CATEGORY_LIST,
+    language: 'he',
+    types: {
+      'twilio/text': {
+        body: '*בחר קטגוריה*\nשמע, לא נתפסתי לאן לשייך — בוחרים מהרשימה ואני סוגר לך את הפינה 🍺',
+      },
+      'twilio/list-picker': {
+        body: '*בחר קטגוריה*\nלא בטוח איפה זה יושב? לוחצים על הכפתור — והכסף לא הולך לאיבוד 💰',
+        button: 'בחר קטגוריה',
+        items: categoryListPickerItems(),
+      },
+    },
+  };
+  let sid = await postTwilioContentTemplate(payload);
+  if (!sid) {
+    const m = await fetchContentFriendlyNameToSid();
+    sid = m.get(CONTENT_FN_CATEGORY_LIST) || '';
+  }
+  return sid;
+}
+
+async function initializeWhatsAppContentTemplates() {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
+  try {
+    const byName = await fetchContentFriendlyNameToSid();
+    if (!contentSidReceiptQr) contentSidReceiptQr = byName.get(CONTENT_FN_RECEIPT_QR) || '';
+    if (!contentSidReceiptQr) contentSidReceiptQr = await createReceiptQuickReplyTemplate();
+    if (!contentSidCategoryList) contentSidCategoryList = byName.get(CONTENT_FN_CATEGORY_LIST) || '';
+    if (!contentSidCategoryList) contentSidCategoryList = await createCategoryListTemplate();
+    console.log(
+      '[config] Twilio Content SIDs:',
+      contentSidReceiptQr ? `${contentSidReceiptQr.slice(0, 8)}…` : '(receipt QR off)',
+      '|',
+      contentSidCategoryList ? `${contentSidCategoryList.slice(0, 8)}…` : '(category list off)'
+    );
+  } catch (e) {
+    console.warn('[twilio-content] initialize:', e.message);
+  }
+}
+
+async function ensureWhatsAppContentTemplates() {
+  if (!contentTemplatesInitPromise) {
+    contentTemplatesInitPromise = initializeWhatsAppContentTemplates();
+  }
+  await contentTemplatesInitPromise;
+}
+
+async function sendWhatsAppContentMessage(waNorm, contentSid, variablesObj) {
+  if (!twilioClient || !FROM_WHATSAPP_NUMBER || !waNorm || !contentSid) return false;
+  const to = waNorm.startsWith('whatsapp:') ? waNorm : fmtWA(waNorm);
+  try {
+    const payload = {
+      from: fmtWA(FROM_WHATSAPP_NUMBER),
+      to,
+      contentSid,
+    };
+    if (variablesObj && Object.keys(variablesObj).length > 0) {
+      payload.contentVariables = JSON.stringify(variablesObj);
+    }
+    await twilioClient.messages.create(payload);
+    console.log('[whatsapp] content outbound:', contentSid.slice(0, 12), '…');
+    return true;
+  } catch (e) {
+    console.error('[whatsapp] content message failed:', e.message);
+    return false;
+  }
+}
+
+async function sendReceiptSuccessQuickReply(waNorm, confirmationBody) {
+  await ensureWhatsAppContentTemplates();
+  if (!contentSidReceiptQr) {
+    await replyWhatsAppToUser(
+      waNorm,
+      `${confirmationBody}\n\n*מה הלאה?*\n• *סיכום חודשי* — כתוב *סיכום*\n• *מחיקה* — כתוב *מחק* (או כפתור כשמופיע)\nהחבר החכם לא שופט, רק שומר על הכיס 🕵️‍♂️`
+    );
+    return;
+  }
+  const ok = await sendWhatsAppContentMessage(waNorm, contentSidReceiptQr, { 1: confirmationBody });
+  if (!ok) await replyWhatsAppToUser(waNorm, confirmationBody);
+}
+
+/** Inbound rich messages: ButtonPayload / ButtonText / InteractiveData list_reply */
+function parseInboundInteractive(req) {
+  const btnPayload = String(req.body.ButtonPayload || '').trim();
+  const btnText = String(req.body.ButtonText || '').trim();
+  let listId = String(req.body.ListId || req.body.ListReplyId || '').trim();
+  try {
+    const raw = req.body.InteractiveData;
+    if (raw) {
+      const j = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (j?.list_reply?.id) listId = listId || String(j.list_reply.id).trim();
+      if (j?.ListReply?.id) listId = listId || String(j.ListReply.id).trim();
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  const idKey = listId || btnPayload;
+  let categoryPayload = '';
+  if (idKey && LIST_ITEM_ID_TO_CATEGORY[idKey]) categoryPayload = LIST_ITEM_ID_TO_CATEGORY[idKey];
+  return { btnPayload, btnText, listId, categoryPayload };
 }
 
 // ===================== Google Sheets =====================
@@ -1273,17 +1559,19 @@ async function buildAndSendManagementList(res, phone, waNorm) {
 
 function confirmWithImageMsg(amount, desc, category) {
   return (
+    `*סגרנו — הקבלה בפנים* ✅\n` +
     `${savvySuccessDriveAndSheets(amount)}\n` +
-    `(${category} 🍺)\n` +
+    `*קטגוריה:* ${category} 🍺\n` +
     `טעות? *מחק* או *טעות* — נעשה סדר, לא נותנים לכסף לברוח 🕵️‍♂️`
   );
 }
 
 function confirmTextFirstMsg(amount, desc, category) {
   return (
-    `קלטתי 🙂 *${amount} ₪* על *${desc}* — עוד כסף שמגיע לך ברשימה, תחת ${category}.\n\n` +
-    `יש קבלה? שלח תמונה או ענה כן / לא — אל תפספס החזר 💰\n` +
-    `משהו לא מדויק? *מחק* או *טעות*.`
+    `*נרשם — עוד כסף ברשימה* 💰\n` +
+    `קלטתי *${amount} ₪* על *${desc}*, תחת *${category}*.\n\n` +
+    `יש קבלה? שלח תמונה או ענה *כן* / *לא* — אל תפספס החזר 📸\n` +
+    `משהו לא מדויק? *מחק* או *טעות*. החבר החכם כאן 🕵️‍♂️`
   );
 }
 
@@ -1295,6 +1583,43 @@ async function saveFullRow(phone, userSheetValue, amount, desc, category, receip
   us.lastRowIndex = rowIndex;
   us.lastRowTs = Date.now();
   return rowIndex;
+}
+
+const QUICK_UNDO_TTL_MS = 15 * 60 * 1000;
+
+async function handleUndoLastReceiptQuickAction(res, phone, waNorm) {
+  const us = getUserState(phone);
+  const idx = us.lastRowIndex;
+  const ts = us.lastRowTs || 0;
+  if (!idx) {
+    sendTwiML(res, '*אין מה למחוק מהר*\nלא נשמר אצלי רישום אחרון — שלח *מחק* לבחירה מהרשימה. 🍺');
+    return;
+  }
+  if (Date.now() - ts > QUICK_UNDO_TTL_MS) {
+    us.lastRowIndex = null;
+    us.lastRowTs = null;
+    sendTwiML(res, '*פג הזמן למחיקה מהירה*\nעבר יותר מדי זמן — שלח *מחק* ונבחר ידנית מה לנקות 🕵️‍♂️');
+    return;
+  }
+  const row = await getRowByIndexIfOwned(idx, waNorm);
+  if (!row) {
+    us.lastRowIndex = null;
+    us.lastRowTs = null;
+    sendTwiML(res, '*לא מצאתי את השורה*\nאולי כבר נמחקה או שזה לא שלך — נסה *ניהול*.');
+    return;
+  }
+  const img = (getCol(row, 'ReceiptImage') || '').trim();
+  if (img) await deleteDriveFileByUrl(img);
+  const ok = await deleteRowByIndexForOwner(idx, waNorm);
+  us.lastRowIndex = null;
+  us.lastRowTs = null;
+  resetSession(phone);
+  sendTwiML(
+    res,
+    ok
+      ? '*נקיון בעסק* ✨\nמחקתי את הרישום האחרון מהשיטס (ובדרייב אם הייתה קבלה). סדר 💰'
+      : '*אופס*\nמשהו נתקע במחיקה — נסה *ניהול*, לא נותנים לכסף לברוח 🍺'
+  );
 }
 
 /** After user picks category in AWAITING_CATEGORY_CLARIFICATION (exact confirm copy per product spec). */
@@ -1321,7 +1646,8 @@ async function completeExpenseAfterCategoryClarification(res, phone, userSheetVa
     const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, receiptImage);
     resetSession(phone);
     if (receipt === 'Yes' && receiptImage) {
-      sendTwiML(res, confirmCategorySavedExact(category));
+      emptyTwiMLResponse(res);
+      await sendReceiptSuccessQuickReply(phone, confirmWithImageMsg(amount, desc, category));
       return;
     }
     sendTwiMLMulti(res, [
@@ -1412,21 +1738,12 @@ app.post('/whatsapp', async (req, res) => {
   const ctx = buildWhatsAppContext(req);
   const bodyRaw = req.body.Body ?? '';
   const numMedia = parseInt(req.body.NumMedia || '0', 10);
-  const trimmed = String(bodyRaw).trim();
-  const lower = trimmed.toLowerCase();
+  let trimmed = String(bodyRaw).trim();
   const phone = ctx.sessionKey;
   const waNorm = ctx.waNorm;
   const userSheetValue = ctx.userSheetValue;
   const receiptFileBase = `${ctx.fileSlug}_Receipt`;
   const hasMedia = numMedia > 0;
-
-  console.log('[whatsapp] Message received', {
-    from: waNorm || '(missing)',
-    profile: (ctx.profileName || '').slice(0, 40),
-    bodyPreview: trimmed.slice(0, 80),
-    hasMedia,
-    numMedia,
-  });
 
   if (!waNorm) {
     sendTwiML(res, 'לא זוהה מספר שולח. נסה שוב.');
@@ -1437,6 +1754,9 @@ app.post('/whatsapp', async (req, res) => {
     sendTwiML(res, 'מצטער, אין לך הרשאה להשתמש במערכת זו.');
     return;
   }
+
+  const inboundMessageSid = String(req.body.MessageSid || req.body.SmsSid || '').trim();
+  void sendWhatsAppTypingIndicator(inboundMessageSid);
 
   const session = getSession(phone);
 
@@ -1452,7 +1772,47 @@ app.post('/whatsapp', async (req, res) => {
     resetSession(phone);
   }
 
+  const ib = parseInboundInteractive(req);
+  if (session.state === 'AWAITING_CATEGORY_CLARIFICATION' && ib.categoryPayload) {
+    trimmed = ib.categoryPayload;
+  } else if (!trimmed && ib.categoryPayload) {
+    trimmed = ib.categoryPayload;
+  }
+  const lower = trimmed.toLowerCase();
+
+  console.log('[whatsapp] Message received', {
+    from: waNorm || '(missing)',
+    profile: (ctx.profileName || '').slice(0, 40),
+    bodyPreview: trimmed.slice(0, 80),
+    buttonPayload: ib.btnPayload || undefined,
+    listPick: ib.listId || undefined,
+    hasMedia,
+    numMedia,
+  });
+
   const MGMT_OK = 'בוצע! עדכנתי בשיטס — עוקבים אחרי הכסף שמגיע לך 💰';
+
+  const summaryQuick =
+    ib.btnPayload === QR_PAYLOAD_SUMMARY ||
+    (!ib.btnPayload && ib.btnText && /סיכום\s*חודשי/i.test(ib.btnText));
+  const undoQuick =
+    ib.btnPayload === QR_PAYLOAD_UNDO_LAST ||
+    (!ib.btnPayload && ib.btnText && /^מחיקה/i.test(ib.btnText.trim()));
+
+  if (summaryQuick) {
+    try {
+      const txt = await buildMonthlySummary(waNorm);
+      sendTwiML(res, txt || savvySummaryTotalLine(await sumAmountColumn(waNorm)));
+    } catch (e) {
+      console.error('[whatsapp] summary (quick-reply):', e.message);
+      sendTwiML(res, 'אופס, לא הצלחתי למשוך את הסיכום. נסה שוב בעוד רגע?');
+    }
+    return;
+  }
+  if (undoQuick) {
+    await handleUndoLastReceiptQuickAction(res, phone, waNorm);
+    return;
+  }
 
   // ─── AWAITING_CATEGORY_CLARIFICATION ───
   if (session.state === 'AWAITING_CATEGORY_CLARIFICATION') {
@@ -1469,8 +1829,7 @@ app.post('/whatsapp', async (req, res) => {
     }
     const cat = resolveCategoryFromReply(trimmed);
     if (!cat) {
-      session.ts = Date.now();
-      sendTwiML(res, CATEGORY_RETRY_MSG);
+      await startCategoryClarification(res, phone, pick, { waNorm });
       return;
     }
     await completeExpenseAfterCategoryClarification(res, phone, userSheetValue, cat, pick);
@@ -1497,18 +1856,27 @@ app.post('/whatsapp', async (req, res) => {
       const rowNum = us.managementEditRow?.sheetRowNumber;
       if (!rowNum) { clearManagement(phone); resetSession(phone); sendTwiML(res, 'פג תוקף הניהול. שלח *ניהול* מחדש.'); return; }
       if (hasMedia) {
-        const oldLink = us.managementEditRow?.receiptImage || '';
-        const driveLink = await handleMediaUpload(req, receiptFileBase);
-        if (driveLink && oldLink) await deleteDriveFileByUrl(oldLink);
-        await updateMultipleFieldsByIndexForOwner(rowNum, {
-          Receipt: (driveLink || oldLink) ? 'Yes' : 'No',
-          ReceiptImage: driveLink || oldLink || '',
-        }, waNorm);
-        await refreshManagementEditSnapshot(phone, waNorm);
-        session.state = 'MANAGEMENT_EDIT_MENU';
-        touchMgmt();
-        const warn = !driveLink ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}` : '';
-        sendTwiML(res, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
+        emptyTwiMLResponse(res);
+        void (async () => {
+          try {
+            await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
+            const oldLink = us.managementEditRow?.receiptImage || '';
+            const driveLink = await handleMediaUpload(req, receiptFileBase);
+            if (driveLink && oldLink) await deleteDriveFileByUrl(oldLink);
+            await updateMultipleFieldsByIndexForOwner(rowNum, {
+              Receipt: (driveLink || oldLink) ? 'Yes' : 'No',
+              ReceiptImage: driveLink || oldLink || '',
+            }, waNorm);
+            await refreshManagementEditSnapshot(phone, waNorm);
+            session.state = 'MANAGEMENT_EDIT_MENU';
+            touchMgmt();
+            const warn = !driveLink ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}` : '';
+            await replyWhatsAppToUser(waNorm, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
+          } catch (e) {
+            console.error('[whatsapp] mgmt receipt upload:', e.message);
+            await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+          }
+        })();
         return;
       }
       if (lower === 'ביטול' || lower === 'בטל') {
@@ -1573,23 +1941,32 @@ app.post('/whatsapp', async (req, res) => {
       if (!rowNum) { clearManagement(phone); resetSession(phone); sendTwiML(res, 'פג תוקף הניהול. שלח *ניהול* מחדש.'); return; }
 
       if (hasMedia) {
-        const oldLink = us.managementEditRow?.receiptImage || '';
-        const driveLink = await handleMediaUpload(req, receiptFileBase);
-        if (oldLink && driveLink) await deleteDriveFileByUrl(oldLink);
-        const finalImg = driveLink || oldLink;
-        await updateMultipleFieldsByIndexForOwner(rowNum, {
-          Receipt: finalImg ? 'Yes' : 'No',
-          ReceiptImage: finalImg || '',
-        }, waNorm);
-        await refreshManagementEditSnapshot(phone, waNorm);
-        touchMgmt();
-        const warn =
-          !driveLink && !oldLink
-            ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}`
-            : !driveLink
-              ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n(נשמר הקישור הקודם אם היה.)`
-              : '';
-        sendTwiML(res, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
+        emptyTwiMLResponse(res);
+        void (async () => {
+          try {
+            await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
+            const oldLink = us.managementEditRow?.receiptImage || '';
+            const driveLink = await handleMediaUpload(req, receiptFileBase);
+            if (oldLink && driveLink) await deleteDriveFileByUrl(oldLink);
+            const finalImg = driveLink || oldLink;
+            await updateMultipleFieldsByIndexForOwner(rowNum, {
+              Receipt: finalImg ? 'Yes' : 'No',
+              ReceiptImage: finalImg || '',
+            }, waNorm);
+            await refreshManagementEditSnapshot(phone, waNorm);
+            touchMgmt();
+            const warn =
+              !driveLink && !oldLink
+                ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}`
+                : !driveLink
+                  ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n(נשמר הקישור הקודם אם היה.)`
+                  : '';
+            await replyWhatsAppToUser(waNorm, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
+          } catch (e) {
+            console.error('[whatsapp] mgmt menu receipt upload:', e.message);
+            await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+          }
+        })();
         return;
       }
 
@@ -1800,19 +2177,43 @@ app.post('/whatsapp', async (req, res) => {
       return;
     }
     if (hasMedia) {
-      const driveLink = await handleMediaUpload(req, receiptFileBase);
-      if (rowIdx) {
-        const updates = {
-          Receipt: driveLink ? 'Yes' : 'No',
-          ReceiptImage: driveLink || '',
-        };
-        await updateMultipleFieldsByIndexForOwner(rowIdx, updates, waNorm);
-      }
-      resetSession(phone);
-      const msg = driveLink
-        ? '📸 יש! קבלה בדרייב ובשיטס 💰\nלביטול הרישום — *מחק*'
-        : `${DRIVE_UPLOAD_FAIL_USER_MSG}\n\n(הרישום נשמר בלי קובץ בדרייב. לביטול — *מחק*)`;
-      sendTwiML(res, msg);
+      emptyTwiMLResponse(res);
+      void (async () => {
+        try {
+          await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
+          const driveLink = await handleMediaUpload(req, receiptFileBase);
+          if (rowIdx) {
+            const updates = {
+              Receipt: driveLink ? 'Yes' : 'No',
+              ReceiptImage: driveLink || '',
+            };
+            await updateMultipleFieldsByIndexForOwner(rowIdx, updates, waNorm);
+          }
+          resetSession(phone);
+          if (driveLink && rowIdx) {
+            const row = await getRowByIndexIfOwned(rowIdx, waNorm);
+            if (row) {
+              const amt = parseFloat(getCol(row, 'Amount')) || 0;
+              const d = getCol(row, 'Description') || '';
+              const cat = getCol(row, 'Category') || '';
+              await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amt, d, cat));
+            } else {
+              await replyWhatsAppToUser(
+                waNorm,
+                '📸 יש! קבלה בדרייב ובשיטס 💰\nלביטול הרישום — *מחק*'
+              );
+            }
+          } else {
+            await replyWhatsAppToUser(
+              waNorm,
+              `${DRIVE_UPLOAD_FAIL_USER_MSG}\n\n(הרישום נשמר בלי קובץ בדרייב. לביטול — *מחק*)`
+            );
+          }
+        } catch (e) {
+          console.error('[whatsapp] receipt image pipeline:', e.message);
+          await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+        }
+      })();
       return;
     }
     if (lower === 'כן' || lower === 'yes') {
@@ -1843,13 +2244,18 @@ app.post('/whatsapp', async (req, res) => {
       const desc = description || '(ללא תיאור)';
       const category = matchCategory(desc);
       if (!category) {
-        startCategoryClarification(res, phone, {
-          amount,
-          desc,
-          userSheetValue,
-          receipt: pendingDriveLink ? 'Yes' : 'No',
-          receiptImage: pendingDriveLink || '',
-        });
+        await startCategoryClarification(
+          res,
+          phone,
+          {
+            amount,
+            desc,
+            userSheetValue,
+            receipt: pendingDriveLink ? 'Yes' : 'No',
+            receiptImage: pendingDriveLink || '',
+          },
+          { waNorm }
+        );
         return;
       }
       resetSession(phone);
@@ -1870,7 +2276,8 @@ app.post('/whatsapp', async (req, res) => {
         const receipt = pendingDriveLink ? 'Yes' : 'No';
         const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, pendingDriveLink || '');
         if (pendingDriveLink) {
-          sendTwiML(res, confirmWithImageMsg(amount, desc, category));
+          emptyTwiMLResponse(res);
+          await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amount, desc, category));
         } else {
           const ns = getSession(phone);
           ns.state = 'AWAITING_RECEIPT_IMAGE';
@@ -1897,60 +2304,96 @@ app.post('/whatsapp', async (req, res) => {
 
     if (amount) {
       const desc = description || '(ללא תיאור)';
-      const driveLink = await handleMediaUpload(req, receiptFileBase);
-      const category = matchCategory(desc);
-      if (!category) {
-        startCategoryClarification(res, phone, {
-          amount,
-          desc,
-          userSheetValue,
-          receipt: driveLink ? 'Yes' : 'No',
-          receiptImage: driveLink || '',
-        });
-        return;
-      }
+      emptyTwiMLResponse(res);
+      void (async () => {
+        try {
+          await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
+          const driveLink = await handleMediaUpload(req, receiptFileBase);
+          const category = matchCategory(desc);
+          if (!category) {
+            await startCategoryClarification(
+              null,
+              phone,
+              {
+                amount,
+                desc,
+                userSheetValue,
+                receipt: driveLink ? 'Yes' : 'No',
+                receiptImage: driveLink || '',
+              },
+              { useOutboundApi: true, waNorm }
+            );
+            return;
+          }
 
-      if (amount > HIGH_AMOUNT_THRESHOLD) {
-        const s = getSession(phone);
-        s.state = 'AWAITING_HIGH_CONFIRM';
-        s.pendingAmount = amount;
-        s.pendingDesc = desc;
-        s.pendingCategory = category;
-        s.pendingDriveLink = driveLink || '';
-        s.ts = Date.now();
-        sendTwiML(res, `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`);
-        return;
-      }
+          if (amount > HIGH_AMOUNT_THRESHOLD) {
+            const s = getSession(phone);
+            s.state = 'AWAITING_HIGH_CONFIRM';
+            s.pendingAmount = amount;
+            s.pendingDesc = desc;
+            s.pendingCategory = category;
+            s.pendingDriveLink = driveLink || '';
+            s.ts = Date.now();
+            await replyWhatsAppToUser(
+              waNorm,
+              `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`
+            );
+            return;
+          }
 
-      try {
-        const receipt = driveLink ? 'Yes' : 'No';
-        const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, driveLink || '');
-        if (driveLink) {
-          sendTwiML(res, confirmWithImageMsg(amount, desc, category));
-        } else {
-          const ns = getSession(phone);
-          ns.state = 'AWAITING_RECEIPT_IMAGE';
-          ns.receiptRowIndex = rowIdx;
-          ns.ts = Date.now();
-          sendTwiML(
-            res,
-            `קלטתי 🙂 *${amount} ₪* על *${desc}*, תחת ${category}.\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n\nהרישום בשיטס — שלח *תמונה שוב* או *כן* / *לא*. לביטול — *מחק*`
-          );
+          try {
+            const receipt = driveLink ? 'Yes' : 'No';
+            const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, driveLink || '');
+            if (driveLink) {
+              await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amount, desc, category));
+            } else {
+              const ns = getSession(phone);
+              ns.state = 'AWAITING_RECEIPT_IMAGE';
+              ns.receiptRowIndex = rowIdx;
+              ns.ts = Date.now();
+              await replyWhatsAppToUser(
+                waNorm,
+                `קלטתי 🙂 *${amount} ₪* על *${desc}*, תחת ${category}.\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n\nהרישום בשיטס — שלח *תמונה שוב* או *כן* / *לא*. לביטול — *מחק*`
+              );
+            }
+          } catch (se) {
+            console.error('[sheets] append failed:', se.message);
+            await replyWhatsAppToUser(waNorm, 'שגיאה בשמירה, נסה שוב');
+          }
+        } catch (e) {
+          console.error('[whatsapp] scenario A:', e.message);
+          await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
         }
-      } catch (e) {
-        console.error('[sheets] append failed:', e.message);
-        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-      }
+      })();
       return;
     }
 
     // ─── SCENARIO B: Image without expense text ───
-    const driveLink = await handleMediaUpload(req, receiptFileBase);
-    const s = getSession(phone);
-    s.state = 'AWAITING_EXPENSE_DETAILS';
-    s.pendingDriveLink = driveLink || '';
-    s.ts = Date.now();
-    sendTwiML(res, 'קלטתי את הקבלה! 📸\nעל איזה החזר מדובר וכמה זה? (למשל: *50 חניה*) 🍺');
+    emptyTwiMLResponse(res);
+    void (async () => {
+      try {
+        await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
+        const driveLink = await handleMediaUpload(req, receiptFileBase);
+        const s0 = getSession(phone);
+        s0.state = 'AWAITING_EXPENSE_DETAILS';
+        s0.pendingDriveLink = driveLink || '';
+        s0.ts = Date.now();
+        if (driveLink) {
+          await replyWhatsAppToUser(
+            waNorm,
+            'קלטתי את הקבלה! 📸\nעל איזה החזר מדובר וכמה זה? (למשל: *50 חניה*) 🍺'
+          );
+        } else {
+          await replyWhatsAppToUser(
+            waNorm,
+            `${DRIVE_UPLOAD_FAIL_USER_MSG}\n\nשלח שוב *תמונת קבלה*, ואז *סכום + תיאור*.`
+          );
+        }
+      } catch (e) {
+        console.error('[whatsapp] scenario B:', e.message);
+        await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+      }
+    })();
     return;
   }
 
@@ -2064,13 +2507,18 @@ app.post('/whatsapp', async (req, res) => {
     if (parsed.amount && parsed.description) {
       const category = matchCategory(parsed.description);
       if (!category) {
-        startCategoryClarification(res, phone, {
-          amount: parsed.amount,
-          desc: parsed.description,
-          userSheetValue,
-          receipt: 'No',
-          receiptImage: '',
-        });
+        await startCategoryClarification(
+          res,
+          phone,
+          {
+            amount: parsed.amount,
+            desc: parsed.description,
+            userSheetValue,
+            receipt: 'No',
+            receiptImage: '',
+          },
+          { waNorm }
+        );
         return;
       }
       resetSession(phone);
@@ -2102,13 +2550,18 @@ app.post('/whatsapp', async (req, res) => {
     const desc = sanitizeDescription(trimmed) || '(ללא תיאור)';
     const category = matchCategory(desc);
     if (!category) {
-      startCategoryClarification(res, phone, {
-        amount: pendingAmount,
-        desc,
-        userSheetValue,
-        receipt: 'No',
-        receiptImage: '',
-      });
+      await startCategoryClarification(
+        res,
+        phone,
+        {
+          amount: pendingAmount,
+          desc,
+          userSheetValue,
+          receipt: 'No',
+          receiptImage: '',
+        },
+        { waNorm }
+      );
       return;
     }
     resetSession(phone);
@@ -2133,13 +2586,18 @@ app.post('/whatsapp', async (req, res) => {
       const { pendingDesc, pendingCategory } = s;
       const resolved = pendingCategory || matchCategory(pendingDesc);
       if (!resolved) {
-        startCategoryClarification(res, phone, {
-          amount: parsed.amount,
-          desc: pendingDesc,
-          userSheetValue,
-          receipt: 'No',
-          receiptImage: '',
-        });
+        await startCategoryClarification(
+          res,
+          phone,
+          {
+            amount: parsed.amount,
+            desc: pendingDesc,
+            userSheetValue,
+            receipt: 'No',
+            receiptImage: '',
+          },
+          { waNorm }
+        );
         return;
       }
       resetSession(phone);
@@ -2176,7 +2634,8 @@ app.post('/whatsapp', async (req, res) => {
         const receipt = hasImage ? 'Yes' : 'No';
         const rowIdx = await saveFullRow(phone, userSheetValue, pendingAmount, pendingDesc, pendingCategory, receipt, pendingDriveLink || '');
         if (hasImage) {
-          sendTwiML(res, confirmWithImageMsg(pendingAmount, pendingDesc, pendingCategory));
+          emptyTwiMLResponse(res);
+          await sendReceiptSuccessQuickReply(phone, confirmWithImageMsg(pendingAmount, pendingDesc, pendingCategory));
         } else {
           const ns = getSession(phone);
           ns.state = 'AWAITING_RECEIPT_IMAGE';
@@ -2231,13 +2690,18 @@ app.post('/whatsapp', async (req, res) => {
   if (amount && description) {
     const category = matchCategory(description);
     if (!category) {
-      startCategoryClarification(res, phone, {
-        amount,
-        desc: description,
-        userSheetValue,
-        receipt: 'No',
-        receiptImage: '',
-      });
+      await startCategoryClarification(
+        res,
+        phone,
+        {
+          amount,
+          desc: description,
+          userSheetValue,
+          receipt: 'No',
+          receiptImage: '',
+        },
+        { waNorm }
+      );
       return;
     }
     if (amount > HIGH_AMOUNT_THRESHOLD) {
@@ -2310,13 +2774,18 @@ app.post('/webhook', async (req, res) => {
       const desc = description || '(ללא תיאור)';
       const category = matchCategory(desc);
       if (!category) {
-        startCategoryClarification(res, ctx.sessionKey, {
-          amount,
-          desc,
-          userSheetValue: ctx.userSheetValue,
-          receipt: 'No',
-          receiptImage: '',
-        });
+        await startCategoryClarification(
+          res,
+          ctx.sessionKey,
+          {
+            amount,
+            desc,
+            userSheetValue: ctx.userSheetValue,
+            receipt: 'No',
+            receiptImage: '',
+          },
+          { waNorm: ctx.waNorm }
+        );
         return;
       }
       try {
@@ -2393,6 +2862,7 @@ function runLocalUnitChecks() {
   t('category "למונית"', matchCategory('למונית') === 'נסיעות');
   t('category דלק', matchCategory('150 דלק') === 'נסיעות');
   t('resolve "פנגו"', resolveCategoryFromReply('פנגו') === 'חניה');
+  t('resolve list id CAT_PARKING', resolveCategoryFromReply('CAT_PARKING') === 'חניה');
   t('intent "הסיכום"', matchesAny('הסיכום', INTENT_SUMMARY));
   t('detect summary "תראה לי"', detectSummaryIntent('תראה לי מה יש', 'תראה לי מה יש'));
   t('detect summary סטטיסטיקה', detectSummaryIntent('סטטיסטיקה', 'סטטיסטיקה'));
