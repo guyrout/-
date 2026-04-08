@@ -1,6 +1,6 @@
 /**
- * בוט WhatsApp — "החבר החכם מהקיבוץ": החזרים מהקיבוץ בלבד, טון חברי-ישראלי.
- * Twilio + Google Sheets + Drive. עמודות: Date, Amount, Category, Drive_Link, Status, Notes, User
+ * בוט WhatsApp — כלי מינימליסטי להחזרי קיבוץ (Sheets + Drive).
+ * עמודות: Date, Amount, Category, Drive_Link, Status, Notes, User
  */
 
 const fs = require('fs');
@@ -20,17 +20,17 @@ const MessagingResponse = twilio.twiml.MessagingResponse;
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ===================== Persona: Kibbutz Savvy Friend (חבר פיננסי מהקיבוץ) =====================
+// ===================== UI: מינימליסטי, RTL, מפרידי כרטיס =====================
+
+const UI_DIV = '──────────────';
 
 const DRIVE_UPLOAD_FAIL_USER_MSG =
-  'אחי, דרייב עושה בלגן רגע… אל תתן לשקלים לברוח — שלח שוב את הקבלה או שמור אצלך בינתיים, גבר. 💰';
+  'העלאה לדרייב נכשלה.\n\nשלח שוב את הקבלה, או שמור אצלך עד שנסגר.\n\nאם זה נמשך — בדוק הרשאות Drive.';
 
-function savvySuccessDriveAndSheets(amount) {
-  return `יאללה, קלטתי! העליתי לדרייב וסימנתי בשיטס. עוד *${amount} ש״ח* שהקיבוץ חייב להחזיר לך — לא מפספסים. 💪`;
-}
+const MEDIA_PROCESSING_ACK_MSG = 'מעלה את הקובץ… רגע.';
 
 function savvySummaryTotalLine(total) {
-  return `בדקתי לך… *${total} ש״ח* מחכים כהחזר מהקיבוץ. זה הכסף שלך, לא של המזוודה. 📈`;
+  return `*סה״כ מחכה לך:* *${formatShekelDisplay(total)}* ש״ח`;
 }
 
 // ===================== Credentials =====================
@@ -54,10 +54,10 @@ const twilioClient =
 /** WhatsApp Content API (quick-reply / list-picker); optional env overrides */
 let contentSidReceiptQr = (process.env.TWILIO_CONTENT_SID_RECEIPT_QR || '').trim();
 let contentSidCategoryList = (process.env.TWILIO_CONTENT_SID_CATEGORY_LIST || '').trim();
-/** Kibbutz v3: סיכום החזרים / מחיקת אחרון + רשימת 11 קטגוריות */
-const CONTENT_FN_RECEIPT_QR = 'kibbutz_bot_receipt_qr_v3';
-const CONTENT_FN_CATEGORY_LIST = 'kibbutz_bot_category_list_v3';
-const CONTENT_FN_CATEGORY_CONFIRM = 'kibbutz_bot_cat_confirm_v3';
+/** v4: כפתורי טקסט בלבד (ללא אימוג׳י בכפתורים) */
+const CONTENT_FN_RECEIPT_QR = 'kibbutz_bot_receipt_qr_v5';
+const CONTENT_FN_CATEGORY_LIST = 'kibbutz_bot_category_list_v5';
+const CONTENT_FN_CATEGORY_CONFIRM = 'kibbutz_bot_cat_confirm_v5';
 let contentSidCategoryConfirm = (process.env.TWILIO_CONTENT_SID_CATEGORY_CONFIRM || '').trim();
 let contentTemplatesInitPromise = null;
 
@@ -399,7 +399,7 @@ const CAT = {
   hair: 'החזרי תספורת וקוסמטיקה 💇',
   kids: 'החזרי ילדים 👶',
   phone: 'החזרי טלפון 📱',
-  gov: 'החזרי תשלומים ממשלתיים 👩‍⚖️',
+  gov: 'החזרי תשלומים ממשלתיים ⚖️',
   clothing: 'החזרי ביגוד לעובדי חוץ 👕',
   building: 'החזרי בניין 🏡',
   taxi: 'החזרי מוניות 🚕',
@@ -552,7 +552,7 @@ const CATEGORY_MAP = [
 ];
 
 const CLARIFY_CATEGORY_MSG =
-  '*לא בטוח לאיזו קטגוריה זה נכנס* 🧐\nאחי, בוחרים מהרשימה — *לא מנחשים*, רק מחזירים כסף מהקיבוץ 💰';
+  `*בחירת קטגוריה*\n\nלא זיהיתי קטגוריה מהטקסט.\n\nבחר מהרשימה — *לא מנחשים*.`;
 
 /** List-picker id → שם מלא כמו בשיטס */
 const LIST_ITEM_ID_TO_CATEGORY = {
@@ -576,7 +576,7 @@ const QR_PAYLOAD_CAT_YES = 'btn_cat_yes';
 const QR_PAYLOAD_CAT_NO = 'btn_cat_no';
 
 const CATEGORY_RETRY_MSG =
-  'לא נתפסתי… לוחצים על *בחר קטגוריה להחזר* מהרשימה, או כותבים מילה *מפורשת* (מונית / אוטובוס / פנגו…) — גבר, בלי ניחושים 💪';
+  'לא זיהיתי.\n\nלחץ *בחר קטגוריה* ברשימה, או כתוב מילה ברורה (מונית, אוטובוס, פנגו…).';
 
 function normalizeCategoryText(s) {
   if (!s || typeof s !== 'string') return '';
@@ -665,8 +665,34 @@ function categoryEmoji(description) {
   return m && m.length ? m[m.length - 1] : '💰';
 }
 
-function confirmCategorySavedExact(category) {
-  return `יאללה סגור, רשמתי תחת ${category}. אלוף! 💪`;
+function buildDeletionFeedbackCard(description, amount) {
+  const desc = (description || '—').trim() || '—';
+  const amt = formatShekelDisplay(amount);
+  return (
+    `*הפעולה בוטלה*\n\n` +
+    `${UI_DIV}\n\n` +
+    `~${desc} — ${amt} ש״ח~\n\n` +
+    `${UI_DIV}\n\n` +
+    `השורה הוסרה מהגיליון.`
+  );
+}
+
+function buildSuccessRecordCard(amount, category, dateDisplay, options = {}) {
+  const dup = options.duplicateAppend || '';
+  const receiptBlock = options.awaitingReceipt
+    ? `\n\n*קבלה:* שלח תמונה, או השב *כן* / *לא*.`
+    : '';
+  return (
+    `*הפרטים נשמרו בהצלחה*\n\n` +
+    `${UI_DIV}\n\n` +
+    `*קטגוריה:* ${category}\n` +
+    `*סכום:* *${formatShekelDisplay(amount)}* ש״ח\n` +
+    `*תאריך:* ${dateDisplay}\n\n` +
+    `${UI_DIV}\n\n` +
+    `הנתונים עודכנו בגיליון הקיבוץ.` +
+    dup +
+    receiptBlock
+  );
 }
 
 /** Small talk / גישור רגשי → נידנוד לקטגוריה הרלוונטית */
@@ -681,29 +707,26 @@ function tryBridgingSmallTalk(lower, trimmed) {
   const t = ` ${lower} `;
   if (BRIDGE_PSYCH.some((k) => t.includes(k))) {
     return (
-      `אחי, נשמע לא קל — אני פה בשביל להחזיר לך כסף מהקיבוץ 💪\n` +
-      `אם זה טיפול נפשי זה בדרך כלל *${CAT.psych}*, אם יותר רפואה קלאסית — *${CAT.health}*.\n` +
-      `שלח *סכום + מה זה היה + קבלה* ונסגור פינה 📸`
+      `רשמתי.\n\n` +
+      `אגב, אם יש קבלה על *${CAT.psych}* או *${CAT.health}*, אפשר לרשום כאן *סכום + תיאור*.`
     );
   }
   if (BRIDGE_HEALTH.some((k) => t.includes(k))) {
     return (
-      `שומע אותך גבר, הבריאות קודמת 🩺\n` +
-      `קבלות מרופא / בית חולים / קופה — זה בכיוון *${CAT.health}*.\n` +
-      `כשיש לך סכום ופירוט, שולחים ואני דואג לשיטס 💰`
+      `רשמתי.\n\n` +
+      `אגב, אם יש קבלה על *${CAT.health}*, אני פה — *סכום + תיאור*.`
     );
   }
   if (BRIDGE_LOOKS.some((k) => t.includes(k))) {
     return (
-      `יאללה, ליטוש מראה זה לגיטימי 💇\n` +
-      `אם יש קבלה — זה *${CAT.hair}*. שלח *סכום + תיאור* ונכניס לרשימה 📋`
+      `רשמתי.\n\n` +
+      `אגב, אם יש קבלה על *${CAT.hair}*, אפשר לשלוח *סכום + תיאור*.`
     );
   }
   if (BRIDGE_DRIVE.some((k) => t.includes(k))) {
     return (
-      `הכבישים זה אתגר, אני מכיר 🚗\n` +
-      `*${CAT.taxi}* = מוניות / אפליקציות; *${CAT.transit}* = אוטובוס / רכבת / רב־קו; *${CAT.parking}* = חנייה / פנגו.\n` +
-      `תן לי *סכום + מה בדיוק* ולא מפספסים 💰`
+      `רשמתי.\n\n` +
+      `אגב, אם יש קבלה על *${CAT.taxi}*, *${CAT.transit}* או *${CAT.parking}*, אני פה.`
     );
   }
   return null;
@@ -812,9 +835,6 @@ function emptyTwiMLResponse(res) {
   if (res.headersSent) return;
   res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
 }
-
-const MEDIA_PROCESSING_ACK_MSG =
-  'יאללה קיבלתי 📸 רגע מעלה לדרייב ורושם בשיטס — השקלים לא בורחים, אחי 💪';
 
 /** WhatsApp typing indicator (Twilio v2 beta). Requires inbound MessageSid / SmsSid. */
 async function sendWhatsAppTypingIndicator(messageSid) {
@@ -956,18 +976,18 @@ async function postTwilioContentTemplate(payload) {
 }
 
 async function createReceiptQuickReplyTemplate() {
-  const t1 = 'סיכום החזרים 📊';
-  const t2 = 'מחיקת אחרון 🗑️';
+  const t1 = 'סיכום החזרים';
+  const t2 = 'ביטול פעולה אחרונה';
   const payload = {
     friendly_name: CONTENT_FN_RECEIPT_QR,
     language: 'he',
     variables: { 1: 'אישור רישום' },
     types: {
       'twilio/text': {
-        body: '{{1}}\n\n*מה עושים עכשיו?* *סיכום החזרים* או *מחיקת אחרון* — או פשוט כותבים *סיכום* / *מחק*. אחי, אני איתך 💪',
+        body: '{{1}}',
       },
       'twilio/quick-reply': {
-        body: '{{1}}\n\n*יאללה מה הלאה?* שתי הקשות למטה — או במילים, בלי בושה 💰',
+        body: '{{1}}',
         actions: [
           { type: 'QUICK_REPLY', title: clipWhatsAppButtonTitle(t1, 20), id: QR_PAYLOAD_SUMMARY },
           { type: 'QUICK_REPLY', title: clipWhatsAppButtonTitle(t2, 20), id: QR_PAYLOAD_UNDO_LAST },
@@ -989,11 +1009,11 @@ async function createCategoryListTemplate() {
     language: 'he',
     types: {
       'twilio/text': {
-        body: '*בחר קטגוריה להחזר*\nאלופה, לא ניחשתי — בוחרים מהרשימה וסוגרים פינה עם הקיבוץ 💰',
+        body: '*בחר קטגוריה להחזר*\n\nאחת מהרשימה צריכה להתאים לקבלה.',
       },
       'twilio/list-picker': {
-        body: '*בחר קטגוריה להחזר*\nלא בטוחים? לוחצים על הכפתור — והשקלים חוזרים אליך 💪',
-        button: clipWhatsAppButtonTitle('בחר קטגוריה להחזר', 20),
+        body: '*בחר קטגוריה להחזר*\n\nלחץ על הכפתור ובחר מהרשימה.',
+        button: clipWhatsAppButtonTitle('בחר קטגוריה', 20),
         items: categoryListPickerItems(),
       },
     },
@@ -1017,12 +1037,12 @@ async function createCategoryConfirmTemplate() {
         actions: [
           {
             type: 'QUICK_REPLY',
-            title: clipWhatsAppButtonTitle('כן, זה הקטגוריה ✅', 20),
+            title: clipWhatsAppButtonTitle('כן', 20),
             id: QR_PAYLOAD_CAT_YES,
           },
           {
             type: 'QUICK_REPLY',
-            title: clipWhatsAppButtonTitle('לא, שנה לי ✏️', 20),
+            title: clipWhatsAppButtonTitle('לא, בחר מחדש', 20),
             id: QR_PAYLOAD_CAT_NO,
           },
         ],
@@ -1093,7 +1113,7 @@ async function sendReceiptSuccessQuickReply(waNorm, confirmationBody) {
   if (!contentSidReceiptQr) {
     await replyWhatsAppToUser(
       waNorm,
-      `${confirmationBody}\n\n*מה הלאה?*\n• *סיכום החזרים* — כתוב *סיכום*\n• *מחיקת אחרון* — כתוב *מחק*\nאחי, רק מחזירים כסף מהקיבוץ 💪`
+      `${confirmationBody}\n\n*מה הלאה?*\n• *סיכום* — ריכוז החודש\n• *מחק* — ביטול הרישום האחרון`
     );
     return;
   }
@@ -1216,19 +1236,25 @@ async function appendExpenseRow(notes, amount, category, driveLink, userValue) {
   return row;
 }
 
-async function hasDuplicateDateAmount(ownerWaNorm, dateStr, amount) {
+async function hasDuplicateExpenseSameDay(ownerWaNorm, dateStr, amount, category) {
   const data = await getCurrentMonthRows(false, ownerWaNorm);
   if (!data) return false;
   const t = parseFloat(amount);
   if (Number.isNaN(t)) return false;
-  return data.rows.some((r) => r.date === dateStr && Math.abs(r.amt - t) < 0.009);
+  const cat = String(category || '').trim();
+  return data.rows.some(
+    (r) =>
+      r.date === dateStr &&
+      Math.abs(r.amt - t) < 0.009 &&
+      String(r.cat || '').trim() === cat
+  );
 }
 
-async function duplicateExpenseWarningLine(ownerWaNorm, amount) {
+async function duplicateExpenseWarningLine(ownerWaNorm, amount, category) {
   const { date } = formatNow();
-  const hit = await hasDuplicateDateAmount(ownerWaNorm, date, amount);
+  const hit = await hasDuplicateExpenseSameDay(ownerWaNorm, date, amount, category);
   return hit
-    ? '\n\n⚠️ *אחי,* כבר יש רישום באותו יום באותו סכום — וודא שזו לא כפילות.'
+    ? '\n\n*שים לב:* כבר קיים רישום עם אותו *תאריך*, *סכום* ו-*קטגוריה*. וודא שאין כפילות.'
     : '';
 }
 
@@ -1548,39 +1574,23 @@ async function fetchTwoMonthCategoryAggregates(ownerWaNorm) {
   };
 }
 
-/** Month-over-month insight on *total* reimbursed amounts (not per category). */
+/** השוואה חודשית — שורה אחת, בלי רעש */
 function formatMoMTotalInsight(curTotal, prevTotal, prevMonthName) {
   if (prevTotal <= 0) {
-    if (curTotal <= 0) return 'עדיין בלי סכום מצטבר החודש — שווה להתחיל לרשום 💰';
-    return 'זה החודש הראשון עם סכום ברור ברשומות — כך בונים רצף של החזרים 🍺';
+    if (curTotal <= 0) return 'אין עדיין סכום מצטבר החודש.';
+    return 'חודש ראשון עם סכום מסודר ברשומות.';
   }
   const pct = Math.round(((curTotal - prevTotal) / prevTotal) * 100);
-  if (pct === 0) return `בערך באותו היקף כמו *${prevMonthName}* — קו יציב 🕵️‍♂️`;
-  if (pct > 0) return `זה *${pct}%* יותר מ*${prevMonthName}* — יותר כסף ברשימת המגיע לי, עוקבים טוב 📈`;
-  return `זה *${Math.abs(pct)}%* פחות מ*${prevMonthName}* — אולי חודש רגוע, אולי עוד נסגור פינות 😉`;
+  if (pct === 0) return `באותו סדר גודל כמו *${prevMonthName}*.`;
+  if (pct > 0) return `*${pct}%* מעל *${prevMonthName}*.`;
+  return `*${Math.abs(pct)}%* מתחת ל-*${prevMonthName}*.`;
 }
 
-/** תובנה על הקטגוריה המובילה — טון קיבוץ */
+/** שורת הקשר אחרי הדשבורד — קטגוריה מובילה */
 function savvyDeepInsightTopCategory(topCategory, topAmount, grandTotal) {
   if (!topCategory || grandTotal <= 0) return '';
   const share = Math.max(1, Math.round((topAmount / grandTotal) * 100));
-  const byCat = {
-    [CAT.taxi]: `החודש *מוניות* 🚕 תופסות נתח שמע (*~${share}%*) — שווה לוודא שלכל נסיעה יש קבלה, אחי.`,
-    [CAT.transit]: `*תחבורה ציבורית* 🚏 בולטת (*~${share}%*) — רב־קו ואוטובוסים מצטברים, שומרים על הכול בשיטס 💪`,
-    [CAT.parking]: `*חניה* 🅿️ דווקא בולטת (*~${share}%*) — פנגו וחניונים, לא נותנים לזה לברוח בלי קבלה.`,
-    [CAT.phone]: `*סלולר וטלפון* 📱 תופסים (*~${share}%*) — חבילות ומנויים, מחזירים מהקיבוץ כל שקל שמגיע.`,
-    [CAT.health]: `*בריאות* 🩺 משמעותי החודש (*~${share}%*) — הכי חשוב שיש; רשום הכול כדי לגבות מהקיבוץ.`,
-    [CAT.psych]: `*טיפול ופסיכולוג* 🧘 בולט (*~${share}%*) — שומרים עליך ועל הכיס, עם קבלות מסודרות.`,
-    [CAT.hair]: `*תספורת וקוסמטיקה* 💇 עלו החודש (*~${share}%*) — לגיטימי, רק עם קבלות נקיות.`,
-    [CAT.kids]: `*ילדים* 👶 תופסים חלק (*~${share}%*) — גן, מעון, חוגים — מחזירים מה שמגיע למשפחה.`,
-    [CAT.gov]: `*תשלומים ממשלתיים* 👩‍⚖️ בולטים (*~${share}%*) — ביטוח לאומי וכו׳, שווה לעקוב שהכול הוגש.`,
-    [CAT.clothing]: `*ביגוד לעובדי חוץ* 👕 (*~${share}%*) — ציוד ובטיחות, אל תוותר על קבלות.`,
-    [CAT.building]: `*בניין וועד בית* 🏡 (*~${share}%*) — אחזקות משותפות, מחזירים מה שמגיע לדיירים.`,
-  };
-  return (
-    byCat[topCategory] ||
-    `*${topCategory}* תופסת כ-*~${share}%* מהסכום החודשי — עין על הקבלות וההגשות, גבר 💰`
-  );
+  return `הקטגוריה הבולטת: *${topCategory}* — כ-*${share}%* מסך ההחזרים החודש.`;
 }
 
 const QUICKCHART_BASE = 'https://quickchart.io/chart';
@@ -1592,7 +1602,7 @@ const MONTHLY_DOUGHNUT_PASTELS = [
 ];
 
 function summaryChartCaptionShekels(totalDisplay) {
-  return `הנה פילוח ההחזרים שלך. הקיבוץ חייב לך ${totalDisplay} ש"ח! 💰`;
+  return `פילוח לפי קטגוריה · סה״כ *${totalDisplay}* ש״ח`;
 }
 
 /** One-time PNG blobs for Twilio MediaUrl when PUBLIC_WEBHOOK_BASE is set */
@@ -1608,7 +1618,7 @@ function buildMonthlySummaryDoughnutChartJs(entries) {
   const bgStr = entries
     .map((_, i) => JSON.stringify(MONTHLY_DOUGHNUT_PASTELS[i % MONTHLY_DOUGHNUT_PASTELS.length]))
     .join(',');
-  const titleStr = JSON.stringify('פילוח ההחזרים חודשי 📊');
+  const titleStr = JSON.stringify('ריכוז החזרים');
   return `{type:'doughnut',data:{labels:[${labelsJson}],datasets:[{data:[${dataStr}],backgroundColor:[${bgStr}],borderWidth:2,borderColor:'#ffffff'}]},options:{cutoutPercentage:62,legend:{position:'bottom',rtl:true,labels:{fontFamily:'Varela Round, Noto Sans Hebrew',fontColor:'#334155',fontSize:12,padding:14,usePointStyle:true,boxWidth:10}},title:{display:true,text:${titleStr},fontFamily:'Varela Round, Noto Sans Hebrew',fontSize:17,fontColor:'#0f172a',fontStyle:'bold',padding:18},plugins:{datalabels:{display:true,color:'#ffffff',font:{weight:'bold',size:15,family:'Varela Round, Noto Sans Hebrew, Arial'},textStrokeColor:'rgba(15,23,42,0.35)',textStrokeWidth:2,formatter:(value,ctx)=>{var arr=ctx.dataset.data,s=0,i;for(i=0;i<arr.length;i++)s+=arr[i];if(!s)return'';var p=Math.round((value/s)*100);return p<4?'':(p+'%');}}}}}`;
 }
 
@@ -1682,42 +1692,67 @@ async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap, tota
 
   await replyWhatsAppToUser(
     waNorm,
-    'אחי, הגרף לא עלה הפעם — המספרים בהודעה הקודמת עדיין מדויקים. אם יש *PUBLIC_WEBHOOK_BASE*, נשלח תמונה יציבה יותר 💪'
+    'הגרף לא נטען הפעם — הסכומים בהודעה הקודמת נשארים תקפים.'
   );
 }
 
 /**
  * First line: required headline + MoM + insight. Second message: chart (downloaded PNG path or QuickChart URL).
  */
+function formatMonthlyDashboardBody(monthName, categoryTotalsMap, totalShekels, footnoteLines = []) {
+  const sorted = [...categoryTotalsMap.entries()].sort((a, b) => b[1] - a[1]);
+  const body = [];
+  body.push(`*ריכוז החזרים - ${monthName}*`);
+  body.push('');
+  body.push(UI_DIV);
+  body.push('');
+  if (sorted.length === 0) {
+    body.push('אין רישומים החודש.');
+  } else {
+    sorted.forEach(([cat, sum], i) => {
+      body.push(`(${i + 1}) ${cat} — *${formatShekelDisplay(sum)}* ש״ח`);
+    });
+  }
+  body.push('');
+  body.push(UI_DIV);
+  body.push('');
+  body.push(`*סה״כ מחכה לך:* *${formatShekelDisplay(totalShekels)}* ש״ח`);
+  for (const line of footnoteLines) {
+    if (line) {
+      body.push('');
+      body.push(line);
+    }
+  }
+  return body.join('\n');
+}
+
 async function buildVisualSummaryPackage(ownerWaNorm) {
   const agg = await fetchTwoMonthCategoryAggregates(ownerWaNorm);
   if (!agg) return null;
 
+  const now = new Date();
+  const monthName = HEB_MONTHS[now.getMonth()];
   const curTotal = sumCategoryTotalsMap(agg.curByCategory);
   const prevTotal = sumCategoryTotalsMap(agg.prevByCategory);
   const comparison = formatMoMTotalInsight(curTotal, prevTotal, agg.prevMonthName);
 
+  const totalsMap = agg.curByCategory || new Map();
+
   if (agg.curRows.length === 0 || curTotal <= 0) {
     return {
-      firstMessage:
-        `הנה סיכום ההחזרים שלך לחודש זה: סה״כ *0* ש״ח.\n${comparison}\n\nאין עדיין רישומים החודש — שלח אחד ונצייר לך עוגה אמיתית 🍰`,
+      firstMessage: formatMonthlyDashboardBody(monthName, new Map(), 0, [comparison]),
       chartUrl: null,
-      categoryTotals: agg.curByCategory || new Map(),
+      categoryTotals: totalsMap,
     };
   }
 
-  const sorted = [...agg.curByCategory.entries()].sort((a, b) => b[1] - a[1]);
+  const sorted = [...totalsMap.entries()].sort((a, b) => b[1] - a[1]);
   const [topCat, topAmt] = sorted[0];
   const deep = savvyDeepInsightTopCategory(topCat, topAmt, curTotal);
 
-  const firstMessage = [
-    `הנה סיכום ההחזרים שלך לחודש זה: סה״כ *${formatShekelDisplay(curTotal)}* ש״ח. ${comparison}`,
-    deep,
-  ]
-    .filter(Boolean)
-    .join('\n\n');
+  const firstMessage = formatMonthlyDashboardBody(monthName, totalsMap, curTotal, [comparison, deep]);
 
-  return { firstMessage, categoryTotals: agg.curByCategory };
+  return { firstMessage, categoryTotals: totalsMap };
 }
 
 async function sendVisualMonthlySummary(res, waNorm) {
@@ -1733,9 +1768,9 @@ async function sendVisualMonthlySummary(res, waNorm) {
 }
 
 const SUMMARY_FOOTERS = [
-  'אל תהיה פראייר — שמור קבלות, אל תפספס החזרים! 📑',
-  'הכסף הזה אמור לחזור אליך — לא נותנים לו לברוח 💰',
-  'סדר בשיטס = פחות כסף על הרצפה 🍺',
+  'שמירת קבלות עוזרת לסגור החזרים בלי בלבול.',
+  'רישום קבוע = פחות כסף ״תלוי באוויר״.',
+  'יש ספק בקטגוריה? בוחרים מהרשימה — לא מנחשים.',
 ];
 
 async function buildMonthlySummary(ownerWaNorm) {
@@ -1745,7 +1780,7 @@ async function buildMonthlySummary(ownerWaNorm) {
   const monthName = HEB_MONTHS[curMonth];
 
   if (rows.length === 0) {
-    return 'עדיין אין לך החזרים רשומים לחודש הזה. אל תפספס — שלח רישום ונעקוב אחרי הכסף? 🍺';
+    return `*ריכוז החזרים - ${monthName}*\n\nאין עדיין רישומים החודש.\n\nשלח *סכום + תיאור* כדי להתחיל.`;
   }
 
   const categoryTotals = new Map();
@@ -1766,23 +1801,21 @@ async function buildMonthlySummary(ownerWaNorm) {
   const lines = [];
   lines.push(savvySummaryTotalLine(grandTotal));
   lines.push('');
-  lines.push(`📊 *סיכום החזרים חודשי - ${monthName}* 🕵️‍♂️`);
-  lines.push('─────────────────────');
+  lines.push(`*ריכוז החזרים - ${monthName}*`);
+  lines.push(UI_DIV);
 
   for (const [cat, total] of [...categoryTotals.entries()].sort((a, b) => b[1] - a[1])) {
-    const emoji =
-      (cat.match(/\p{Emoji_Presentation}\uFE0F?|\p{Extended_Pictographic}/gu) || []).slice(-1)[0] || '•';
-    lines.push(`${emoji} *${cat}*: ${total} ₪`);
+    lines.push(`*${cat}* — *${formatShekelDisplay(total)}* ש״ח`);
     const items = categoryItems.get(cat) || [];
     if (items.length > 1) {
       for (const it of items) {
         const ts = it.time ? ` (${it.time})` : '';
-        lines.push(`      ${it.desc} — ${it.amt} ₪${ts}`);
+        lines.push(`      ${it.desc} — ${formatShekelDisplay(it.amt)} ש״ח${ts}`);
       }
     }
   }
 
-  lines.push('─────────────────────');
+  lines.push(UI_DIV);
 
   try {
     const prev = await getPrevMonthData(ownerWaNorm);
@@ -1791,8 +1824,8 @@ async function buildMonthlySummary(ownerWaNorm) {
   } catch (_) {}
 
   lines.push('');
-  if (noReceipt > 0) lines.push(`⚠️ ${noReceipt} רישומי החזר בלי קבלה — אל תפספס`);
-  if (notSubmitted > 0) lines.push(`📝 ${notSubmitted} החזרים עדיין לא סומנו כהוגשו`);
+  if (noReceipt > 0) lines.push(`*לתשומת לב:* ${noReceipt} רישומים בלי קבלה בדרייב.`);
+  if (notSubmitted > 0) lines.push(`*סטטוס:* ${notSubmitted} רישומים עדיין לא סומנו כהוגשו.`);
   lines.push('');
   lines.push(SUMMARY_FOOTERS[Math.floor(Math.random() * SUMMARY_FOOTERS.length)]);
   return lines.join('\n');
@@ -1804,7 +1837,7 @@ async function buildMonthlyStats(ownerWaNorm) {
   const { rows, curMonth } = data;
   const monthName = HEB_MONTHS[curMonth];
 
-  if (rows.length === 0) return 'עדיין אין מספיק נתונים לניתוח. רשום עוד החזרים ונסה שוב! 📈';
+  if (rows.length === 0) return 'אין עדיין מספיק רישומים לניתוח. הוסף עוד החזרים ונסה שוב.';
 
   const categoryTotals = buildCategoryTotals(rows);
   let grandTotal = 0;
@@ -1815,12 +1848,11 @@ async function buildMonthlyStats(ownerWaNorm) {
   const topPct = grandTotal > 0 ? Math.round((topAmt / grandTotal) * 100) : 0;
 
   const lines = [];
-  lines.push(`📊 *ניתוח החזרים חודשי - ${monthName}* 🕵️‍♂️`);
-  lines.push('─────────────────────');
-  lines.push(`הקטגוריה הכי בולטת אצלך היא *${topCat}* עם *${topAmt} ₪* שמחכים להחזר.`);
-  lines.push(`זה *${topPct}%* מכלל הכסף שרשמנו החודש 💰`);
+  lines.push(`*ניתוח החזרים - ${monthName}*`);
+  lines.push(UI_DIV);
+  lines.push(`הקטגוריה הבולטת: *${topCat}* — *${formatShekelDisplay(topAmt)}* ש״ח (${topPct}% מהחודש).`);
   lines.push('');
-  lines.push(`סה"כ ${rows.length} רישומים | *${grandTotal} ₪* סך הכל`);
+  lines.push(`*${rows.length}* רישומים · סה״כ *${formatShekelDisplay(grandTotal)}* ש״ח`);
 
   if (sorted.length > 1) {
     lines.push('');
@@ -1828,7 +1860,7 @@ async function buildMonthlyStats(ownerWaNorm) {
     for (const [cat, amt] of sorted) {
       const pct = Math.round((amt / grandTotal) * 100);
       const bar = '█'.repeat(Math.max(1, Math.round(pct / 5)));
-      lines.push(`${bar} ${cat}: ${amt} ₪ (${pct}%)`);
+      lines.push(`${bar} ${cat}: ${formatShekelDisplay(amt)} ש״ח (${pct}%)`);
     }
   }
 
@@ -1965,7 +1997,7 @@ async function startDeleteSelectionFlow(res, phone, waNorm) {
   if (items.length === 0) {
     clearDeleteFlow(phone);
     console.log('[delete] no rows to delete for', phone);
-    sendTwiML(res, 'אין רישומי החזר החודש למחיקה. רוצה להוסיף אחד שלא ילך לאיבוד? 🍺');
+    sendTwiML(res, 'אין רישומים למחיקה החודש.');
     return;
   }
   console.log('[delete] selection list shown', phone, 'count=', items.length);
@@ -1976,8 +2008,7 @@ async function startDeleteSelectionFlow(res, phone, waNorm) {
   s.state = 'AWAITING_DELETE_SELECTION';
   s.ts = Date.now();
   const lines = [
-    'טעות? קורה. בוא נתקן בלי לאבד כסף 🍺',
-    `הנה עד *${items.length}* הרישומים האחרונים של החודש — שלח *מספר* למחיקה:`,
+    `*מחיקה*\n\nעד *${items.length}* רישומים אחרונים — שלח *מספר שורה* למחיקה:`,
     '',
   ];
   for (const it of items) {
@@ -2015,12 +2046,12 @@ async function refreshManagementEditSnapshot(phone, waNorm) {
 async function buildAndSendManagementList(res, phone, waNorm) {
   const data = await getCurrentMonthRows(true, waNorm);
   if (!data || data.rows.length === 0) {
-    sendTwiML(res, 'אין רישומי החזר לחודש הזה. שלח אחד ונשמור על הכסף 💰');
+    sendTwiML(res, 'אין רישומים לחודש הזה. שלח *סכום + תיאור* כדי להתחיל.');
     return;
   }
 
   const items = [];
-  const header = `📋 *ניהול החזרים — ${HEB_MONTHS[data.curMonth]}* 🕵️‍♂️\nשלח מספר שורה לעריכה (תוקף 10 דק׳):\n`;
+  const header = `*ניהול החזרים — ${HEB_MONTHS[data.curMonth]}*\n\nשלח מספר שורה לעריכה (תוקף 10 דק׳):\n`;
 
   for (let i = 0; i < data.rows.length; i++) {
     const r = data.rows[i];
@@ -2066,24 +2097,6 @@ async function buildAndSendManagementList(res, phone, waNorm) {
   sendTwiMLMulti(res, chunks);
 }
 
-function confirmWithImageMsg(amount, desc, category) {
-  return (
-    `*סגרנו — הקבלה בפנים* ✅\n` +
-    `${savvySuccessDriveAndSheets(amount)}\n` +
-    `*קטגוריה:* ${category}\n` +
-    `טעות? *מחק* — לא מזרימים כסף לריק, גבר 💪`
-  );
-}
-
-function confirmTextFirstMsg(amount, desc, category, dupSuffix = '') {
-  return (
-    `*נרשם — עוד כסף שחוזר מהקיבוץ* 💰\n` +
-    `קלטתי *${amount} ₪* על *${desc}*, תחת *${category}*.${dupSuffix}\n\n` +
-    `יש קבלה? שלח תמונה או *כן* / *לא* — אל תפספס החזר 📸\n` +
-    `משהו לא מדויק? *מחק* או *טעות*. אני איתך, אחי 💪`
-  );
-}
-
 async function saveFullRow(phone, userSheetValue, amount, desc, category, driveLink) {
   const row = await appendExpenseRow(desc, amount, category, (driveLink || '').trim(), userSheetValue);
   const rowIndex = row ? row.rowNumber : null;
@@ -2102,7 +2115,7 @@ async function beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick
   s.pendingSuggestedCategory = suggestedCategory;
   s.ts = Date.now();
   await ensureWhatsAppContentTemplates();
-  const line = `נראה לי שזה *${suggestedCategory}* — סוגרים ככה?`;
+  const line = `לשייך ל-*${suggestedCategory}*?`;
   if (contentSidCategoryConfirm && waNorm) {
     const ok = await sendWhatsAppContentMessage(waNorm, contentSidCategoryConfirm, { 1: line });
     if (ok) {
@@ -2110,7 +2123,7 @@ async function beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick
       return;
     }
   }
-  const fallback = `${line}\n\n*כן* / *לא* — או כפתורים כשמופיעים 💪`;
+  const fallback = `${line}\n\n*כן* / *לא*, או הכפתורים למטה.`;
   if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, fallback);
   else if (res && !res.headersSent) sendTwiML(res, fallback);
 }
@@ -2119,7 +2132,7 @@ async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue,
   const amount = pick.amount;
   const desc = pick.desc;
   const receiptImage = (pick.receiptImage || '').trim();
-  const dupLine = await duplicateExpenseWarningLine(waNorm, amount);
+  const dupLine = await duplicateExpenseWarningLine(waNorm, amount, category);
 
   if (amount > HIGH_AMOUNT_THRESHOLD) {
     resetSession(phone);
@@ -2130,19 +2143,27 @@ async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue,
     s.pendingCategory = category;
     s.pendingDriveLink = receiptImage;
     s.ts = Date.now();
-    sendTwiML(res, `סכום חזק (*${amount} ש״ח*) — *בטוח* שזה נכון? (כן / לא) 💪`);
+    sendTwiML(
+      res,
+      `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
+    );
     return;
   }
 
   try {
     const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receiptImage);
+    const { date } = formatNow();
+    const card = buildSuccessRecordCard(amount, category, date, {
+      duplicateAppend: dupLine,
+      awaitingReceipt: !receiptImage,
+    });
     resetSession(phone);
     if (receiptImage) {
       emptyTwiMLResponse(res);
-      await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amount, desc, category) + dupLine);
+      await sendReceiptSuccessQuickReply(waNorm, card);
       return;
     }
-    sendTwiML(res, confirmTextFirstMsg(amount, desc, category, dupLine));
+    sendTwiML(res, card);
     const ns = getSession(phone);
     ns.state = 'AWAITING_RECEIPT_IMAGE';
     ns.receiptRowIndex = rowIdx;
@@ -2160,22 +2181,27 @@ async function handleUndoLastReceiptQuickAction(res, phone, waNorm) {
   const idx = us.lastRowIndex;
   const ts = us.lastRowTs || 0;
   if (!idx) {
-    sendTwiML(res, '*אין מה למחוק מהר*\nלא נשמר אצלי רישום אחרון — שלח *מחק* לבחירה מהרשימה. 🍺');
+    sendTwiML(
+      res,
+      `*ביטול מהיר*\n\nאין רישום אחרון לביטול.\n\nהשתמש ב-*מחק* לבחירה מהרשימה.`
+    );
     return;
   }
   if (Date.now() - ts > QUICK_UNDO_TTL_MS) {
     us.lastRowIndex = null;
     us.lastRowTs = null;
-    sendTwiML(res, '*פג הזמן למחיקה מהירה*\nעבר יותר מדי זמן — שלח *מחק* ונבחר ידנית מה לנקות 🕵️‍♂️');
+    sendTwiML(res, `*ביטול מהיר*\n\nפג התוקף.\n\nהשתמש ב-*מחק*.`);
     return;
   }
   const row = await getRowByIndexIfOwned(idx, waNorm);
   if (!row) {
     us.lastRowIndex = null;
     us.lastRowTs = null;
-    sendTwiML(res, '*לא מצאתי את השורה*\nאולי כבר נמחקה או שזה לא שלך — נסה *ניהול*.');
+    sendTwiML(res, `*ביטול מהיר*\n\nהשורה לא נמצאה.\n\nנסה *ניהול*.`);
     return;
   }
+  const rowDesc = sheetNotes(row) || '(ללא תיאור)';
+  const rowAmt = parseFloat(getCol(row, 'Amount')) || 0;
   const img = sheetDriveLink(row);
   if (img) await deleteDriveFileByUrl(img);
   const ok = await deleteRowByIndexForOwner(idx, waNorm);
@@ -2184,9 +2210,7 @@ async function handleUndoLastReceiptQuickAction(res, phone, waNorm) {
   resetSession(phone);
   sendTwiML(
     res,
-    ok
-      ? '*נקיון בעסק* ✨\nמחקתי את הרישום האחרון מהשיטס (ובדרייב אם הייתה קבלה). סדר 💰'
-      : '*אופס*\nמשהו נתקע במחיקה — נסה *ניהול*, לא נותנים לכסף לברוח 🍺'
+    ok ? buildDeletionFeedbackCard(rowDesc, rowAmt) : `*שגיאה*\n\nלא הצלחתי לבטל.\n\nנסה *ניהול*.`
   );
 }
 
@@ -2198,40 +2222,40 @@ async function completeExpenseAfterCategoryClarification(res, phone, waNorm, use
 // ===================== Response Templates =====================
 
 function buildCategoriesList() {
-  const lines = ['📋 *11 הקטגוריות הרשמיות להחזר מהקיבוץ:*', ''];
-  for (const c of CANONICAL_CATEGORIES) lines.push(`• ${c}`);
+  const lines = ['*11 קטגוריות רשמיות להחזר מהקיבוץ:*', ''];
+  for (const c of CANONICAL_CATEGORIES) lines.push(c);
   lines.push('');
-  lines.push('לא בטוחים? אני אשלח רשימה אינטראקטיבית — *לא מנחשים*, רק מחזירים כסף 💪');
+  lines.push('לא בטוחים? אשלח רשימה לבחירה — בוחרים מהרשימה, לא מנחשים.');
   return lines.join('\n');
 }
 
 function buildGreeting() {
   return (
-    'היי אחי! אני *החבר החכם מהקיבוץ* — רק *החזרים*, רק שקלים שחוזרים אליך 💰\n\n' +
-    '*איך רושמים:*\n' +
-    '• *סכום + תיאור* (למשל: *45 אוטובוס* או *120 מונית להייפה*)\n' +
-    '• *תמונת קבלה* עם טקסט — עולה לדרייב ונכנס לשיטס\n' +
-    '• *תמונה בלבד* — אבקש ממך סכום ומה זה היה\n\n' +
-    '*פקודות שימושיות:*\n' +
-    '• *סיכום* / *תראה לי* — כמה הקיבוץ חייב להחזיר לך החודש\n' +
-    '• *עזרה* — מדריך קצר\n' +
-    '• *מחק* — תיקון טעות\n' +
-    '• *ניהול* — כל הרישומים של החודש\n\n' +
-    '• *מה לא הוגש* / *הגשתי* — מעקב אחרי סטטוס\n\n' +
-    'יאללה, לא מפספסים החזרים 💪'
+    `*היי*\n\n` +
+    `אני כאן ל-*החזרי קיבוץ*: רישום קבלות וסכומים לגיליון.\n\n` +
+    `*איך רושמים*\n\n` +
+    `• *סכום + תיאור* (למשל *45 אוטובוס*)\n` +
+    `• *תמונת קבלה* עם טקסט — נשמר בדרייב ובגיליון\n` +
+    `• *תמונה בלבד* — אבקש אחר כך סכום ותיאור\n\n` +
+    `*פקודות*\n\n` +
+    `• *סיכום* — ריכוז החודש\n` +
+    `• *עזרה* — מדריך קצר\n` +
+    `• *מחק* — ביטול רישום\n` +
+    `• *ניהול* — רשימת החודש\n` +
+    `• *מה לא הוגש* / *הגשתי* — סטטוס`
   );
 }
 
 function buildHelpGuide() {
   return (
-    'אחי, הנה הכל בקצרה 💪\n\n' +
-    '*רישום:* סכום + תיאור, או קבלה (עם או בלי טקסט).\n' +
-    '*סיכום:* *סיכום* / *תראה לי* — כמה ש״ח מחכים כהחזר מהקיבוץ.\n' +
-    '*טעות:* *מחק* — בוחרים מהרשימה ומאשרים.\n' +
-    '*ניהול:* *ניהול* — עורכים שורות מהחודש.\n' +
-    '*קטגוריות:* *קטגוריות* — רואים את ה-11 הרשמיות.\n' +
-    '*הגשה:* *מה לא הוגש* / *הגשתי*.\n\n' +
-    'נתקעת? *שלום* ומתחילים מחדש. אלוף! 💰'
+    `*עזרה קצרה*\n\n` +
+    `*רישום:* סכום + תיאור, או קבלה (עם או בלי טקסט).\n\n` +
+    `*סיכום:* כתוב *סיכום* — מקבלים ריכוז וגרף.\n\n` +
+    `*טעות:* *מחק* — בוחרים שורה ומאשרים.\n\n` +
+    `*ניהול:* עריכת רישומי החודש.\n\n` +
+    `*קטגוריות:* *קטגוריות* — הרשימה המלאה.\n\n` +
+    `*הגשה:* *מה לא הוגש* / *הגשתי*.\n\n` +
+    `נתקעת? שלח *שלום* ומתחילים מחדש.`
   );
 }
 
@@ -2340,14 +2364,16 @@ app.post('/whatsapp', async (req, res) => {
     numMedia,
   });
 
-  const MGMT_OK = 'בוצע! עדכנתי בשיטס — עוקבים אחרי הכסף שמגיע לך 💰';
+  const MGMT_OK = '*בוצע*\n\nהגיליון עודכן.';
 
   const summaryQuick =
     ib.btnPayload === QR_PAYLOAD_SUMMARY ||
     (!ib.btnPayload && ib.btnText && /סיכום\s*(?:החזרים|חודשי)/i.test(ib.btnText));
   const undoQuick =
     ib.btnPayload === QR_PAYLOAD_UNDO_LAST ||
-    (!ib.btnPayload && ib.btnText && /מחיקת\s*אחרון|^מחיקה/i.test(ib.btnText.trim()));
+    (!ib.btnPayload &&
+      ib.btnText &&
+      /ביטול\s*פעולה\s*אחרונה|מחיקת\s*אחרון|^מחיקה/i.test(ib.btnText.trim()));
 
   if (summaryQuick) {
     try {
@@ -2364,7 +2390,7 @@ app.post('/whatsapp', async (req, res) => {
   }
 
   if (session.state === 'IDLE' && !hasMedia && (lower === 'ביטול' || lower === 'בטל')) {
-    sendTwiML(res, 'סבבה אחי, אין בעיה — כשתרצה ממשיכים 💪');
+    sendTwiML(res, 'סבבה — כשתרצה ממשיכים.');
     return;
   }
 
@@ -2375,7 +2401,7 @@ app.post('/whatsapp', async (req, res) => {
   ) {
     sendTwiML(
       res,
-      'אחי, אין לי כרגע מה לאשר 😄 שלח *סכום + תיאור* (למשל *80 מונית*) או *סיכום* לראות כמה הקיבוץ חייב לך 💪'
+      'אין כרגע משהו לאשר.\n\nשלח *סכום + תיאור* או *סיכום* לריכוז החודש.'
     );
     return;
   }
@@ -2386,7 +2412,7 @@ app.post('/whatsapp', async (req, res) => {
     const suggested = session.pendingSuggestedCategory;
     if (!pick || suggested == null || typeof pick.amount !== 'number' || Number.isNaN(pick.amount)) {
       resetSession(phone);
-      sendTwiML(res, 'פג תוקף — שלח שוב *סכום + תיאור*, גבר 💪');
+      sendTwiML(res, 'פג תוקף — שלח שוב *סכום + תיאור*.');
       return;
     }
     if (ib.categoryPayload && CANONICAL_CATEGORIES.includes(ib.categoryPayload)) {
@@ -2409,7 +2435,7 @@ app.post('/whatsapp', async (req, res) => {
       await startCategoryClarification(res, phone, pick, { waNorm });
       return;
     }
-    sendTwiML(res, 'עדיין מחכה: *זו הקטגוריה?* לחץ כפתור או *כן* / *לא* 💪');
+    sendTwiML(res, 'עדיין מחכה לאישור הקטגוריה — כפתור או *כן* / *לא*.');
     return;
   }
 
@@ -2418,7 +2444,7 @@ app.post('/whatsapp', async (req, res) => {
     const pick = session.pendingCategoryPick;
     if (!pick || typeof pick.amount !== 'number' || Number.isNaN(pick.amount)) {
       resetSession(phone);
-      sendTwiML(res, 'פג תוקף או חסרים נתונים — שלח שוב *סכום + תיאור*. 🍺');
+      sendTwiML(res, 'פג תוקף או חסרים נתונים — שלח שוב *סכום + תיאור*.');
       return;
     }
     if (detectDeleteIntent(lower, trimmed) && !hasMedia) {
@@ -2579,6 +2605,9 @@ app.post('/whatsapp', async (req, res) => {
       }
 
       if (matchesAny(lower, ['מחק', 'מחיקה', 'תמחק']) && !matchesAny(lower, ['מחק שורה', 'מחק מהרשימה'])) {
+        const edSnapshot = us.managementEditRow
+          ? { desc: us.managementEditRow.desc, amt: us.managementEditRow.amt }
+          : null;
         const oldLink = us.managementEditRow?.receiptImage || '';
         if (oldLink) await deleteDriveFileByUrl(oldLink);
         const delOk = await deleteRowByIndexForOwner(rowNum, waNorm);
@@ -2587,7 +2616,7 @@ app.post('/whatsapp', async (req, res) => {
         sendTwiML(
           res,
           delOk
-            ? 'בוצע! השורה נמחקה מהשיטס. ✨\nשלח *ניהול* לרשימה מעודכנת.'
+            ? `${buildDeletionFeedbackCard(edSnapshot?.desc || '(ללא תיאור)', edSnapshot?.amt || 0)}\n\nשלח *ניהול* לרשימה מעודכנת.`
             : 'לא הצלחתי למחוק (אין הרשאה או השורה לא נמצאה).'
         );
         return;
@@ -2610,11 +2639,11 @@ app.post('/whatsapp', async (req, res) => {
       if (matchesAny(lower, ['שלח קבלה', 'קבלה', 'תמונת קבלה', 'צילום קבלה'])) {
         session.state = 'MANAGEMENT_AWAITING_RECEIPT_EDIT';
         touchMgmt();
-        sendTwiML(res, 'שלח *תמונת קבלה* 📸 (הקובץ הישן ב-Drive יימחק אוטומטית)');
+        sendTwiML(res, 'שלח *תמונת קבלה* (הקובץ הישן בדרייב יוחלף).');
         return;
       }
 
-      sendTwiML(res, `לא הבנתי 🤔\n${editMenuPrompt(us.managementEditRow)}`);
+      sendTwiML(res, `לא הבנתי.\n\n${editMenuPrompt(us.managementEditRow)}`);
       return;
     }
 
@@ -2701,8 +2730,8 @@ app.post('/whatsapp', async (req, res) => {
       sendTwiML(
         res,
         ok
-          ? 'מחקתי את הרישום מהשיטס. אם הייתה קבלה בדרייב — ניסיתי לנקות גם שם. סדר 💰'
-          : 'לא הצלחתי למחוק את השורה, נסה שוב או השתמש ב*ניהול*.'
+          ? buildDeletionFeedbackCard(pd.desc || '(ללא תיאור)', pd.amt || 0)
+          : 'לא הצלחתי למחוק את השורה, נסה שוב או השתמש ב-*ניהול*.'
       );
       return;
     }
@@ -2714,7 +2743,7 @@ app.post('/whatsapp', async (req, res) => {
     }
     sendTwiML(
       res,
-      `מחכה ל*כן* או *לא*: האם למחוק את *${pd.desc}* בסך *${pd.amt} ₪*?`
+      `*אישור מחיקה*\n\nלמחוק את *${pd.desc}* — *${formatShekelDisplay(pd.amt)}* ש״ח?\n\n*כן* / *לא*`
     );
     return;
   }
@@ -2790,12 +2819,17 @@ app.post('/whatsapp', async (req, res) => {
               const amt = parseFloat(getCol(row, 'Amount')) || 0;
               const d = sheetNotes(row) || '';
               const cat = getCol(row, 'Category') || '';
-              const dupLine = await duplicateExpenseWarningLine(waNorm, amt);
-              await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amt, d, cat) + dupLine);
+              const dupLine = await duplicateExpenseWarningLine(waNorm, amt, cat);
+              const dateDisp = String(getCol(row, 'Date') || formatNow().date);
+              const card = buildSuccessRecordCard(amt, cat, dateDisp, {
+                duplicateAppend: dupLine,
+                awaitingReceipt: false,
+              });
+              await sendReceiptSuccessQuickReply(waNorm, card);
             } else {
               await replyWhatsAppToUser(
                 waNorm,
-                '📸 יש! קבלה בדרייב ובשיטס 💰\nלביטול הרישום — *מחק*'
+                `*הקבלה נשמרה*\n\nהקישור עודכן בגיליון.\n\nלביטול — *מחק*.`
               );
             }
           } else {
@@ -2814,19 +2848,24 @@ app.post('/whatsapp', async (req, res) => {
     if (matchesAny(lower, INTENT_CONFIRM_YES)) {
       if (rowIdx) await updateRowReceiptFlagOnly(rowIdx, waNorm, true);
       resetSession(phone);
-      sendTwiML(res, '✅ יאללה, קבלה מאושרת — לא מפספסים 💪\nיש עוד קבלה? שלח *סכום + תיאור* 📸');
+      sendTwiML(
+        res,
+        `*קבלה מאושרת*\n\nרישמת שיש קבלה.\n\nיש עוד החזר? שלח *סכום + תיאור*.`
+      );
       return;
     }
     if (matchesAny(lower, INTENT_CONFIRM_NO)) {
       if (rowIdx) await updateRowReceiptFlagOnly(rowIdx, waNorm, false);
       resetSession(phone);
-      sendTwiML(res, '📌 תשמור את הקבלה אצלך — זה הכסף שלך מהקיבוץ 💰\nיש עוד משהו? שלח כשמוכן 💪');
+      sendTwiML(
+        res,
+        `*בלי קבלה בדרייב*\n\nהרישום נשאר בגיליון.\n\nיש עוד? שלח *סכום + תיאור* כשתוכל.`
+      );
       return;
     }
     sendTwiML(
       res,
-      'לא הבנתי 🤔 עדיין מחכה ל*תמונת קבלה* או ל*כן* / *לא*.\n' +
-        'רוצה לתקן? שלח *מחק* או *טעות* — אעזור לבחור מה למחוק.'
+      `*ממתין לקבלה*\n\nשלח *תמונה*, או השב *כן* / *לא*.\n\nלביטול הרישום — *מחק*.`
     );
     return;
   }
@@ -2864,7 +2903,7 @@ app.post('/whatsapp', async (req, res) => {
       await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick, category, {});
       return;
     }
-    sendTwiML(res, 'לא קלטתי סכום. *סכום + תיאור* (למשל: *50 אוטובוס*) — אל תפספס החזר 💪');
+    sendTwiML(res, 'לא קלטתי סכום.\n\nשלח *סכום + תיאור* (למשל *50 אוטובוס*).');
     return;
   }
 
@@ -2928,7 +2967,7 @@ app.post('/whatsapp', async (req, res) => {
         if (driveLink) {
           await replyWhatsAppToUser(
             waNorm,
-            'קלטתי את הקבלה! 📸\nעל איזה החזר מדובר וכמה זה? (למשל: *50 פנגו* / *120 מונית*) 💪'
+            '*קבלה התקבלה*\n\nעל איזה החזר וכמה זה?\n\n(למשל *50 פנגו* / *120 מונית*)'
           );
         } else {
           await replyWhatsAppToUser(
@@ -2964,7 +3003,7 @@ app.post('/whatsapp', async (req, res) => {
   // ─── Analytics-style report (מילות מפתח נפרדות מסיכום פיננסי) ───
   if (!hasMedia && /ניתוח|הכי\s+יקרה|\bstats\b|פירוט\s+לפי\s+קטגוריה/i.test(trimmed)) {
     try {
-      sendTwiML(res, (await buildMonthlyStats(waNorm)) || 'עדיין דל — רשום עוד החזרים ונריץ ניתוח 🕵️‍♂️');
+      sendTwiML(res, (await buildMonthlyStats(waNorm)) || 'אין עדיין מספיק רישומים לניתוח.');
     } catch (e) {
       console.error('[sheets] stats failed:', e.message);
       sendTwiML(res, 'אופס, משהו נתקשה בניתוח. נסה שוב?');
@@ -2977,13 +3016,16 @@ app.post('/whatsapp', async (req, res) => {
     try {
       const open = await getUnsubmittedRows(waNorm);
       if (open.length === 0) {
-        sendTwiML(res, '✅ לחודש הזה אין החזרים שממתינים להגשה — הכול דחוס ויפה 💰');
+        sendTwiML(res, '*סטטוס הגשה*\n\nלחודש הזה אין רישומים שממתינים להגשה.');
       } else {
         const total = open.reduce((s, r) => s + r.amt, 0);
-        const lines = [`📝 *${open.length} החזרים עדיין לא הוגשו (${total} ₪ שמחכים):*`, ''];
+        const lines = [
+          `*לא הוגשו (${open.length})*\n\nסה״כ *${formatShekelDisplay(total)}* ש״ח ממתינים:`,
+          '',
+        ];
         for (const r of open) {
-          const rcpt = r.receipt === 'Yes' ? '✅' : '❌';
-          lines.push(`• ${r.desc} — *${r.amt} ₪* (${r.cat}) | קבלה: ${rcpt}`);
+          const rcpt = r.receipt === 'Yes' ? 'יש קבלה' : 'אין קבלה';
+          lines.push(`• ${r.desc} — *${formatShekelDisplay(r.amt)}* ש״ח (${r.cat}) · ${rcpt}`);
         }
         lines.push('', 'שלח *"הגשתי"* כדי לסמן הכל כהוגש.');
         sendTwiML(res, lines.join('\n'));
@@ -2999,9 +3041,12 @@ app.post('/whatsapp', async (req, res) => {
   if (matchesAny(lower, INTENT_MARK_SUBMITTED)) {
     try {
       const count = await markAllCurrentMonthSubmitted(waNorm);
-      sendTwiML(res, count === 0
-        ? '✅ הכול כבר מסומן כהוגש — לא מפספסים שקל 🍺'
-        : `יש! *${count}* החזרים סומנו כהוגשו. עוד צעד לקראת הכסף בכיס 💰`);
+      sendTwiML(
+        res,
+        count === 0
+          ? '*סטטוס*\n\nהכול כבר מסומן כהוגש לחודש הזה.'
+          : `*עודכן*\n\n*${count}* רישומים סומנו כהוגשו.`
+      );
     } catch (e) {
       console.error('[sheets] mark submitted failed:', e.message);
       sendTwiML(res, 'שגיאה בעדכון, נסה שוב');
@@ -3033,7 +3078,10 @@ app.post('/whatsapp', async (req, res) => {
 
   // ─── POLITENESS ───
   if (matchesAny(lower, INTENT_POLITENESS)) {
-    sendTwiML(res, 'בשמחה גבר! 💪\nיש עוד קבלה או החזר לרשום? שלח *סכום + תיאור* או תמונה — ממשיכים לגבות מהקיבוץ 💰');
+    sendTwiML(
+      res,
+      'יש עוד החזר לרשום?\n\nשלח *סכום + תיאור* או *תמונת קבלה*.'
+    );
     return;
   }
 
@@ -3111,7 +3159,10 @@ app.post('/whatsapp', async (req, res) => {
   if (getSession(phone).state === 'AWAITING_AMOUNT') {
     if (CURRENCY_RE.test(trimmed)) {
       resetSession(phone);
-      sendTwiML(res, '⚠️ רושמים ב-₪ בלבד — בלי סימני מטבע זר. שלח שוב, גבר 💪');
+      sendTwiML(
+        res,
+        '*מטבע*\n\nרושמים ב-*ש״ח* בלבד, בלי סימני מטבע זר.\n\nשלח שוב.'
+      );
       return;
     }
     const s = getSession(phone);
@@ -3162,7 +3213,7 @@ app.post('/whatsapp', async (req, res) => {
       resetSession(phone);
       try {
         const hasImage = !!pendingDriveLink;
-        const dupLine = await duplicateExpenseWarningLine(waNorm, pendingAmount);
+        const dupLine = await duplicateExpenseWarningLine(waNorm, pendingAmount, pendingCategory);
         const rowIdx = await saveFullRow(
           phone,
           userSheetValue,
@@ -3171,18 +3222,20 @@ app.post('/whatsapp', async (req, res) => {
           pendingCategory,
           pendingDriveLink || ''
         );
+        const { date } = formatNow();
+        const card = buildSuccessRecordCard(pendingAmount, pendingCategory, date, {
+          duplicateAppend: dupLine,
+          awaitingReceipt: !hasImage,
+        });
         if (hasImage) {
           emptyTwiMLResponse(res);
-          await sendReceiptSuccessQuickReply(
-            phone,
-            confirmWithImageMsg(pendingAmount, pendingDesc, pendingCategory) + dupLine
-          );
+          await sendReceiptSuccessQuickReply(waNorm, card);
         } else {
           const ns = getSession(phone);
           ns.state = 'AWAITING_RECEIPT_IMAGE';
           ns.receiptRowIndex = rowIdx;
           ns.ts = Date.now();
-          sendTwiML(res, confirmTextFirstMsg(pendingAmount, pendingDesc, pendingCategory, dupLine));
+          sendTwiML(res, card);
         }
       } catch (e) {
         console.error('[sheets] append failed:', e.message);
@@ -3197,7 +3250,7 @@ app.post('/whatsapp', async (req, res) => {
       lower === 'טעות'
     ) {
       resetSession(phone);
-      sendTwiML(res, 'בסדר, ביטלתי — כלום לא נשמר. כשתהיה מוכן, נרשום מחדש בלי לאבד כסף 🍺');
+      sendTwiML(res, '*בוטל*\n\nלא נשמר כלום.\n\nכשתהיה מוכן — שלח שוב *סכום + תיאור*.');
       return;
     }
     sendTwiML(
@@ -3221,7 +3274,10 @@ app.post('/whatsapp', async (req, res) => {
 
   // ─── CURRENCY ALERT ───
   if (CURRENCY_RE.test(trimmed)) {
-    sendTwiML(res, '⚠️ רושמים החזרים ב-₪ בלבד.\nאם זה בש"ח — שלח בלי סימן מטבע זר, שלא יבלבל 💪');
+    sendTwiML(
+      res,
+      '*מטבע*\n\nרושמים ב-*ש״ח* בלבד.\n\nאם הסכום בש״ח — שלח בלי סימן מטבע זר.'
+    );
     return;
   }
 
@@ -3268,7 +3324,10 @@ app.post('/whatsapp', async (req, res) => {
     s.state = 'AWAITING_DESCRIPTION';
     s.pendingAmount = amount;
     s.ts = Date.now();
-    sendTwiML(res, `קיבלתי *${amount} ₪*. על איזה החזר? (למשל: *פנגו* / *מונית*) 💪`);
+    sendTwiML(
+      res,
+      `קיבלתי *${formatShekelDisplay(amount)}* ש״ח.\n\nעל איזה החזר? (למשל *פנגו* / *מונית*)`
+    );
     return;
   }
 
@@ -3284,7 +3343,10 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  sendTwiML(res, 'לא הבנתי 🤔\n*סכום + תיאור* (למשל: *45 אוטובוס* / *80 מונית*) — או *תמונת קבלה* 📸\n*"שלום"* לעזרה. אחי, לא מפספסים החזרים 💪');
+  sendTwiML(
+    res,
+    'לא הבנתי.\n\nשלח *סכום + תיאור* או *תמונת קבלה*.\n\n*שלום* — עזרה.'
+  );
   } catch (err) {
     console.error('[whatsapp] unhandled error:', err && err.stack ? err.stack : err);
     if (!res.headersSent) {
@@ -3325,7 +3387,8 @@ app.post('/webhook', async (req, res) => {
       try {
         await saveToSheet(desc, amount, category, ctx.userSheetValue);
       } catch (e) { console.error('[webhook] sheets:', e.message); }
-      sendTwiML(res, `יאללה קלטתי 🙂 *${amount} ₪* על *${desc}* — תחת ${category}. עוד כסף שחוזר מהקיבוץ 💪`);
+      const { date } = formatNow();
+      sendTwiML(res, buildSuccessRecordCard(amount, category, date, { awaitingReceipt: false }));
     } else {
       sendTwiML(res, `קיבלתי ממך: ${message}`);
     }
@@ -3346,15 +3409,15 @@ if (TO_WHATSAPP_NUMBER && twilioClient) {
     const s = getSession(cronOwnerWaNorm);
     s.state = 'AWAITING_DAILY_REPLY';
     s.ts = Date.now();
-    await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, 'היי! 👋 היו היום החזרים לרשום? אל תפספס — כן / לא 🍺');
+    await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, '*תזכורת יומית*\n\nהיו היום החזרים לרשום?\n\n*כן* / *לא*');
   }, { timezone: CRON_TZ });
 
   cron.schedule('0 10 * * 0', async () => {
     try {
       const missing = await getMissingReceiptRows(cronOwnerWaNorm);
       if (missing.length === 0) return;
-      const lines = [`היי, יש *${missing.length}* החזרים בלי אישור קבלה. הכל שמור אצלך? אל תפספס 📑`, ''];
-      for (const r of missing.slice(0, 10)) lines.push(`• ${r.desc} — *${r.amt} ₪*`);
+      const lines = [`*קבלות חסרות (${missing.length})*\n\nאישרת שיש קבלה לכולם?`, ''];
+      for (const r of missing.slice(0, 10)) lines.push(`• ${r.desc} — *${formatShekelDisplay(r.amt)}* ש״ח`);
       if (missing.length > 10) lines.push(`...ועוד ${missing.length - 10}`);
       await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, lines.join('\n'));
     } catch (e) { console.error('[cron] Missing receipts failed:', e.message); }
@@ -3365,13 +3428,18 @@ if (TO_WHATSAPP_NUMBER && twilioClient) {
       const open = await getUnsubmittedRows(cronOwnerWaNorm);
       if (open.length === 0) return;
       const total = open.reduce((s, r) => s + r.amt, 0);
-      await sendWhatsAppMessage(TO_WHATSAPP_NUMBER,
-        `🚨 יום הגשת החזרים מתקרב!\nיש *${open.length}* רישומים פתוחים, *${total} ₪* שמחכים — לא נותנים לזה ללכת לאיבוד.\n\nשלח *"הגשתי"* לסמן הכל 💰`);
+      await sendWhatsAppMessage(
+        TO_WHATSAPP_NUMBER,
+        `*תזכורת הגשה*\n\nיש *${open.length}* רישומים פתוחים, סה״כ *${formatShekelDisplay(total)}* ש״ח.\n\nשלח *הגשתי* לסמן הכול.`
+      );
     } catch (e) { console.error('[cron] Deadline alert failed:', e.message); }
   }, { timezone: CRON_TZ });
 
   cron.schedule('0 20 29 * *', async () => {
-    await sendWhatsAppMessage(TO_WHATSAPP_NUMBER, 'תזכורת חודשית 📋 זמן להגיש — שלח *"סיכום"* ונראה כמה ש"ח מחכים להחזר. כסף על הרצפה! 📈');
+    await sendWhatsAppMessage(
+      TO_WHATSAPP_NUMBER,
+      '*תזכורת חודשית*\n\nזמן לסגור החזרים — שלח *סיכום* לריכוז.'
+    );
   }, { timezone: CRON_TZ });
 
   console.log(`[cron] Scheduled: daily 20:00, Sundays 10:00, 25th 20:00, 29th 20:00 (${CRON_TZ})`);
@@ -3416,7 +3484,7 @@ function runLocalUnitChecks() {
     return (
       js.includes('doughnut') &&
       js.includes('datalabels') &&
-      js.includes('פילוח') &&
+      js.includes('ריכוז החזרים') &&
       js.includes('Varela Round') &&
       js.includes('#FFB5C2')
     );
