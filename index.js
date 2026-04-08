@@ -722,6 +722,27 @@ async function replyWhatsAppToUser(waNorm, body) {
   }
 }
 
+/** WhatsApp image(s) from public URL(s) (e.g. QuickChart PNG). */
+async function replyWhatsAppWithMedia(waNorm, mediaUrlList, body) {
+  if (!twilioClient || !FROM_WHATSAPP_NUMBER || !waNorm || !mediaUrlList?.length) return false;
+  const to = waNorm.startsWith('whatsapp:') ? waNorm : fmtWA(waNorm);
+  try {
+    const payload = {
+      from: fmtWA(FROM_WHATSAPP_NUMBER),
+      to,
+      mediaUrl: mediaUrlList,
+    };
+    const b = body != null ? String(body).trim() : '';
+    if (b) payload.body = b;
+    await twilioClient.messages.create(payload);
+    console.log('[whatsapp] outbound media:', mediaUrlList.length, 'url(s)');
+    return true;
+  } catch (e) {
+    console.error('[whatsapp] outbound media failed:', e.message);
+    return false;
+  }
+}
+
 function clipWhatsAppButtonTitle(s, maxCp = 20) {
   const cp = [...s];
   if (cp.length <= maxCp) return s;
@@ -1225,6 +1246,206 @@ const HEB_MONTHS = [
   'ינואר', 'פברואר', 'מרץ', 'אפריל', 'מאי', 'יוני',
   'יולי', 'אוגוסט', 'ספטמבר', 'אוקטובר', 'נובמבר', 'דצמבר',
 ];
+
+/** QuickChart pie slice colors (canonical sheet categories; unknown → slate) */
+const CATEGORY_CHART_COLORS = {
+  חניה: '#2563EB',
+  נסיעות: '#EAB308',
+  אגרות: '#EA580C',
+  תקשורת: '#22C55E',
+  'ציוד משרדי': '#A855F7',
+  בריאות: '#16A34A',
+};
+
+function formatShekelDisplay(n) {
+  const x = Number(n);
+  if (Number.isNaN(x)) return '0';
+  return Number.isInteger(x) ? String(x) : x.toFixed(2).replace(/\.?0+$/, '');
+}
+
+function sumCategoryTotalsMap(totalsMap) {
+  let s = 0;
+  for (const v of totalsMap.values()) s += v;
+  return s;
+}
+
+/**
+ * Last 2 calendar months: category totals + row counts (for comparisons).
+ */
+async function fetchTwoMonthCategoryAggregates(ownerWaNorm) {
+  const now = new Date();
+  const cy = now.getFullYear();
+  const cm = now.getMonth();
+  let py = cy;
+  let pm = cm - 1;
+  if (pm < 0) {
+    pm = 11;
+    py -= 1;
+  }
+  const curRows = (await getRowsForMonth(cy, cm, false, ownerWaNorm)) || [];
+  const prevRows = (await getRowsForMonth(py, pm, false, ownerWaNorm)) || [];
+  return {
+    prevMonthName: HEB_MONTHS[pm],
+    curByCategory: buildCategoryTotals(curRows),
+    prevByCategory: buildCategoryTotals(prevRows),
+    curRows,
+  };
+}
+
+/** Month-over-month insight on *total* reimbursed amounts (not per category). */
+function formatMoMTotalInsight(curTotal, prevTotal, prevMonthName) {
+  if (prevTotal <= 0) {
+    if (curTotal <= 0) return 'עדיין בלי סכום מצטבר החודש — שווה להתחיל לרשום 💰';
+    return 'זה החודש הראשון עם סכום ברור ברשומות — כך בונים רצף של החזרים 🍺';
+  }
+  const pct = Math.round(((curTotal - prevTotal) / prevTotal) * 100);
+  if (pct === 0) return `בערך באותו היקף כמו *${prevMonthName}* — קו יציב 🕵️‍♂️`;
+  if (pct > 0) return `זה *${pct}%* יותר מ*${prevMonthName}* — יותר כסף ברשימת המגיע לי, עוקבים טוב 📈`;
+  return `זה *${Math.abs(pct)}%* פחות מ*${prevMonthName}* — אולי חודש רגוע, אולי עוד נסגור פינות 😉`;
+}
+
+/** Top spending category — Savvy Friend “deep insight” (emoji matches persona). */
+function savvyDeepInsightTopCategory(topCategory, topAmount, grandTotal) {
+  if (!topCategory || grandTotal <= 0) return '';
+  const share = Math.max(1, Math.round((topAmount / grandTotal) * 100));
+  switch (topCategory) {
+    case 'נסיעות':
+      return `שים לב, החודש *המוניות והנסיעות* 🚕 תפסו נתח גדול (*כ-${share}%* מהסכום) — שווה לוודא שכל נסיעה עם קבלה חוזרת אליך.`;
+    case 'חניה':
+      return `*חניה* 🅿️ דווקא בולטת החודש (*~${share}%*) — פנגו, חניונים וכו׳ מצטברים בלי לשים לב; רשמתי הכול כדי שלא תפספס שקל.`;
+    case 'אגרות':
+      return `*אגרות וכביש* 🛣️ לקחו חלק יפה מהעוגה החודש — בול, ככה שומרים על הזכות להחזר ולא נותנים למדינה “הלוואה חינם”.`;
+    case 'תקשורת':
+      return `*תקשורת* 📱 בולטת החודש — סים, סלולר, נטו; העיקר שהמערכת תחזיר מה שמגיע לך על כל שורה.`;
+    case 'ציוד משרדי':
+      return `*ציוד משרדי* 🖊️ קיבל תשומת לב החודש — שווה לוודא שכל קנייה קטנה גם כן מגיעה לרשימת המגיע לי.`;
+    case 'בריאות':
+      return `השקעת *הרבה בבריאות* 🩺 החודש — הכי חשוב! רשמתי הכול כדי שהקיבוץ (או המעסיק) יחזיר לך כל שקל שמגיע.`;
+    default:
+      return `*${topCategory}* תופסת כ-*~${share}%* מהסכום החודשי — שווה לעין על זה שהכל מוגש בזמן 💰`;
+  }
+}
+
+const QUICKCHART_BASE = 'https://quickchart.io/chart';
+
+/**
+ * Pie chart PNG URL via QuickChart. Hebrew labels: UTF-8 JSON → base64 + encoding=base64
+ * (avoids broken labels from raw URL-encoded Unicode in some clients).
+ */
+function buildQuickChartPieImageUrl(categoryTotalsMap) {
+  const entries = [...categoryTotalsMap.entries()]
+    .filter(([, amt]) => amt > 0)
+    .sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) return null;
+
+  const labels = entries.map(([cat, amt]) => `${cat} (${formatShekelDisplay(amt)} ש״ח)`);
+  const data = entries.map(([, amt]) => amt);
+  const backgroundColor = entries.map(([cat]) => CATEGORY_CHART_COLORS[cat] || '#94A3B8');
+
+  const chartConfig = {
+    type: 'pie',
+    data: {
+      labels,
+      datasets: [
+        {
+          data,
+          backgroundColor,
+          borderWidth: 2,
+          borderColor: '#ffffff',
+        },
+      ],
+    },
+    options: {
+      plugins: {
+        legend: {
+          position: 'bottom',
+          rtl: true,
+          labels: {
+            font: { size: 12, family: 'Noto Sans Hebrew' },
+            color: '#0f172a',
+            padding: 14,
+          },
+        },
+        title: {
+          display: true,
+          text: 'התפלגות החזרים לפי קטגוריה',
+          font: { size: 15, family: 'Noto Sans Hebrew' },
+          color: '#020617',
+          padding: { bottom: 8 },
+        },
+      },
+    },
+  };
+
+  const jsonUtf8 = JSON.stringify(chartConfig);
+  const chartB64 = Buffer.from(jsonUtf8, 'utf8').toString('base64');
+  const qs = new URLSearchParams();
+  qs.set('encoding', 'base64');
+  qs.set('chart', chartB64);
+  qs.set('w', '640');
+  qs.set('h', '640');
+  qs.set('devicePixelRatio', '1');
+  qs.set('version', '4');
+  qs.set('format', 'png');
+  qs.set('backgroundColor', 'white');
+  return `${QUICKCHART_BASE}?${qs.toString()}`;
+}
+
+/**
+ * First line: required headline + MoM + insight. Second message: chart URL (caller sends via Twilio media).
+ */
+async function buildVisualSummaryPackage(ownerWaNorm) {
+  const agg = await fetchTwoMonthCategoryAggregates(ownerWaNorm);
+  if (!agg) return null;
+
+  const curTotal = sumCategoryTotalsMap(agg.curByCategory);
+  const prevTotal = sumCategoryTotalsMap(agg.prevByCategory);
+  const comparison = formatMoMTotalInsight(curTotal, prevTotal, agg.prevMonthName);
+
+  if (agg.curRows.length === 0 || curTotal <= 0) {
+    return {
+      firstMessage:
+        `הנה סיכום ההחזרים שלך לחודש זה: סה״כ *0* ש״ח.\n${comparison}\n\nאין עדיין רישומים החודש — שלח אחד ונצייר לך עוגה אמיתית 🍰`,
+      chartUrl: null,
+    };
+  }
+
+  const sorted = [...agg.curByCategory.entries()].sort((a, b) => b[1] - a[1]);
+  const [topCat, topAmt] = sorted[0];
+  const deep = savvyDeepInsightTopCategory(topCat, topAmt, curTotal);
+
+  const firstMessage = [
+    `הנה סיכום ההחזרים שלך לחודש זה: סה״כ *${formatShekelDisplay(curTotal)}* ש״ח. ${comparison}`,
+    deep,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const chartUrl = buildQuickChartPieImageUrl(agg.curByCategory);
+  return { firstMessage, chartUrl };
+}
+
+async function sendVisualMonthlySummary(res, waNorm) {
+  const pkg = await buildVisualSummaryPackage(waNorm);
+  if (!pkg) {
+    sendTwiML(res, 'אופס, לא הצלחתי לקרוא את השיטס. נסה שוב?');
+    return;
+  }
+  sendTwiML(res, pkg.firstMessage);
+  if (pkg.chartUrl) {
+    const ok = await replyWhatsAppWithMedia(
+      waNorm,
+      [pkg.chartUrl],
+      '📊 *העוגה שלך לפי קטגוריות* — עברית מסודרת, כמו שצריך. החבר החכם 🍰'
+    );
+    if (!ok) {
+      await replyWhatsAppToUser(
+        waNorm,
+        'שמע, הגרף לא יצא בנסיעה (בעיה בשליחת התמונה) — אבל המספרים בהודעה הקודמת מדויקים. נסה *סיכום* שוב מאוחר יותר 🕵️‍♂️'
+      );
+    }
+  }
+}
 
 const SUMMARY_FOOTERS = [
   'אל תהיה פראייר — שמור קבלות, אל תפספס החזרים! 📑',
@@ -1801,8 +2022,7 @@ app.post('/whatsapp', async (req, res) => {
 
   if (summaryQuick) {
     try {
-      const txt = await buildMonthlySummary(waNorm);
-      sendTwiML(res, txt || savvySummaryTotalLine(await sumAmountColumn(waNorm)));
+      await sendVisualMonthlySummary(res, waNorm);
     } catch (e) {
       console.error('[whatsapp] summary (quick-reply):', e.message);
       sendTwiML(res, 'אופס, לא הצלחתי למשוך את הסיכום. נסה שוב בעוד רגע?');
@@ -2406,8 +2626,7 @@ app.post('/whatsapp', async (req, res) => {
   // ─── SUMMARY — כולל "תראה לי", "כמה הוצאתי", "סטטיסטיקה" וכו׳ ───
   if (detectSummaryIntent(lower, trimmed) && !hasMedia) {
     try {
-      const txt = await buildMonthlySummary(waNorm);
-      sendTwiML(res, txt || savvySummaryTotalLine(await sumAmountColumn(waNorm)));
+      await sendVisualMonthlySummary(res, waNorm);
     } catch (e) {
       console.error('[sheets] summary failed:', e.message);
       sendTwiML(res, 'אופס, לא הצלחתי למשוך את הסיכום. נסה שוב בעוד רגע?');
@@ -2873,6 +3092,14 @@ function runLocalUnitChecks() {
   t('intent "הגשתי"', matchesAny('הגשתי', INTENT_MARK_SUBMITTED));
   t('intent "ניהול"', matchesAny('ניהול', INTENT_MANAGEMENT));
   t('intent "מחק שורה"', matchesAny('מחק שורה', INTENT_MANAGEMENT));
+  t('MoM total insight up', formatMoMTotalInsight(120, 100, 'ינואר').includes('20%'));
+  t('QuickChart base64 URL', (() => {
+    const u = buildQuickChartPieImageUrl(new Map([
+      ['חניה', 40],
+      ['נסיעות', 60],
+    ]));
+    return u && u.includes('encoding=base64') && u.includes('quickchart.io');
+  })());
 }
 
 function postForm(port, urlPath, fields) {
