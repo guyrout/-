@@ -175,12 +175,19 @@ function getDriveClient() {
 }
 
 async function downloadTwilioMedia(mediaUrl) {
-  console.log('[media] Downloading media via axios (arraybuffer)...');
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    console.error('[media] Download failed: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN missing');
+    throw new Error('Twilio credentials not configured for media download');
+  }
+  console.log('[media] Downloading media via axios (arraybuffer + Twilio Basic auth)...');
   const resp = await axios.get(mediaUrl, {
     responseType: 'arraybuffer',
     maxContentLength: 25 * 1024 * 1024,
     maxBodyLength: 25 * 1024 * 1024,
-    auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+    auth: {
+      username: TWILIO_ACCOUNT_SID,
+      password: TWILIO_AUTH_TOKEN,
+    },
   });
   const buffer = Buffer.from(resp.data);
   console.log('[media] Download finished, bytes:', buffer.length);
@@ -204,7 +211,8 @@ async function uploadToDrive(buffer, contentType, fileName) {
     console.error('[drive] Drive upload failed: no Drive client (check service account)');
     return null;
   }
-  if (!GOOGLE_DRIVE_FOLDER_ID) {
+  const folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+  if (!folderId) {
     console.error('[drive] Drive upload failed: GOOGLE_DRIVE_FOLDER_ID is not set');
     return null;
   }
@@ -212,20 +220,22 @@ async function uploadToDrive(buffer, contentType, fileName) {
   console.log('[drive] Drive upload started:', fileName, `(${buffer.length} bytes)`);
   const fileMetadata = {
     name: fileName,
-    parents: [GOOGLE_DRIVE_FOLDER_ID],
+    parents: [folderId],
   };
 
   try {
     const createRes = await drive.files.create({
       requestBody: fileMetadata,
       media: { mimeType: contentType, body: bufferToStream(buffer) },
-      fields: 'id',
+      fields: 'id,webViewLink',
     });
     const id = createRes.data.id;
-    console.log('[drive] Drive upload finished: fileId=', id);
-    return `https://drive.google.com/file/d/${id}/view`;
-  } catch (e) {
-    console.error('[drive] Upload failed:', e.message);
+    const webViewLink =
+      createRes.data.webViewLink || (id ? `https://drive.google.com/file/d/${id}/view` : null);
+    console.log('[drive] Drive upload finished: fileId=', id, 'webViewLink=', webViewLink ? '(set)' : '(missing)');
+    return webViewLink;
+  } catch (error) {
+    console.error('DRIVE ERROR DETAILS:', error.response ? error.response.data : error.message);
     return null;
   }
 }
@@ -253,7 +263,10 @@ async function handleMediaUpload(req, fileBaseName) {
     const link = await uploadToDrive(buffer, contentType, fileName);
     return link;
   } catch (e) {
-    console.error('[media] Download/upload failed:', e.message);
+    console.error(
+      '[media] Download/upload failed:',
+      e.response ? e.response.data : e.message
+    );
     return null;
   }
 }
