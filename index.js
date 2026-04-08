@@ -1,7 +1,6 @@
 /**
- * בוט WhatsApp — "החבר החכם" (The Savvy Friend): מעקב החזרים, לא לפספס כסף.
- * Twilio + Google Sheets + Google Drive לתמונות קבלה.
- * Columns: A–H as before | I User (ProfileName + E.164, used for multi-user filtering)
+ * בוט WhatsApp — "החבר החכם מהקיבוץ": החזרים מהקיבוץ בלבד, טון חברי-ישראלי.
+ * Twilio + Google Sheets + Drive. עמודות: Date, Amount, Category, Drive_Link, Status, Notes, User
  */
 
 const fs = require('fs');
@@ -21,18 +20,17 @@ const MessagingResponse = twilio.twiml.MessagingResponse;
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// ===================== Persona: The Savvy Friend (החבר החכם להחזרים) =====================
+// ===================== Persona: Kibbutz Savvy Friend (חבר פיננסי מהקיבוץ) =====================
 
-/** Exact copy when Drive upload fails — do not paraphrase */
 const DRIVE_UPLOAD_FAIL_USER_MSG =
-  'שמע, הגוגל דרייב עושה קצת בעיות... אל תיתן לכסף הזה ללכת לאיבוד, תנסה לשלוח לי את הקבלה שוב? או שבנתיים תשמור אותה אצלך שלא תלך לאיבוד.';
+  'אחי, דרייב עושה בלגן רגע… אל תתן לשקלים לברוח — שלח שוב את הקבלה או שמור אצלך בינתיים, גבר. 💰';
 
 function savvySuccessDriveAndSheets(amount) {
-  return `יש, קלטתי! העליתי לדרייב ורשמתי בשיטס. עוד ${amount} ש"ח שנכנסו לרשימת ה-מגיע לי שלך. 💰`;
+  return `יאללה, קלטתי! העליתי לדרייב וסימנתי בשיטס. עוד *${amount} ש״ח* שהקיבוץ חייב להחזיר לך — לא מפספסים. 💪`;
 }
 
 function savvySummaryTotalLine(total) {
-  return `עשיתי בדיקה זריזה... הצטברו לך ${total} ש"ח שמחכים להחזר. כסף על הרצפה! 📈`;
+  return `בדקתי לך… *${total} ש״ח* מחכים כהחזר מהקיבוץ. זה הכסף שלך, לא של המזוודה. 📈`;
 }
 
 // ===================== Credentials =====================
@@ -56,9 +54,11 @@ const twilioClient =
 /** WhatsApp Content API (quick-reply / list-picker); optional env overrides */
 let contentSidReceiptQr = (process.env.TWILIO_CONTENT_SID_RECEIPT_QR || '').trim();
 let contentSidCategoryList = (process.env.TWILIO_CONTENT_SID_CATEGORY_LIST || '').trim();
-/** v2: quick-reply titles סיכום חודשי 📊 / מחיקה 🗑️; bump if Twilio copy changes */
-const CONTENT_FN_RECEIPT_QR = 'expense_bot_receipt_success_qr_v2';
-const CONTENT_FN_CATEGORY_LIST = 'expense_bot_category_list_he_v2';
+/** Kibbutz v3: סיכום החזרים / מחיקת אחרון + רשימת 11 קטגוריות */
+const CONTENT_FN_RECEIPT_QR = 'kibbutz_bot_receipt_qr_v3';
+const CONTENT_FN_CATEGORY_LIST = 'kibbutz_bot_category_list_v3';
+const CONTENT_FN_CATEGORY_CONFIRM = 'kibbutz_bot_cat_confirm_v3';
+let contentSidCategoryConfirm = (process.env.TWILIO_CONTENT_SID_CATEGORY_CONFIRM || '').trim();
 let contentTemplatesInitPromise = null;
 
 function fmtWA(num) {
@@ -357,8 +357,14 @@ const INTENT_CATEGORIES = ['קטגוריות', 'רשימה', 'categories'];
 const INTENT_BUDGET = ['יעד', 'תקציב', 'budget'];
 const INTENT_NOT_SUBMITTED = ['מה לא הוגש', 'לא הוגש', 'פתוחות', 'unsubmitted'];
 const INTENT_MARK_SUBMITTED = ['הגשתי', 'הוגש', 'submitted'];
-const INTENT_CONFIRM_YES = ['כן', 'yes', 'כ', 'בטוח', 'נכון'];
-const INTENT_CONFIRM_NO = ['לא', 'no', 'ל'];
+const INTENT_CONFIRM_YES = [
+  'כן', 'yes', 'כ', 'בטוח', 'נכון', 'יאללה', 'יאללה כן', 'אש', 'סגור', 'סגור סגור',
+  'בטח', 'עוד', 'מסכים', 'מאשר', 'נשמע', 'קדימה', 'ok', 'okay',
+];
+const INTENT_CONFIRM_NO = [
+  'לא', 'no', 'ל', 'עזוב', 'לא עכשיו', 'לא רוצה', 'טעות', 'ביטול', 'בטל', 'תעזוב',
+  'לא מעוניין', 'לא מעוניינת', 'עזוב אותי', 'תפסיק',
+];
 /** Full-month management list: ניהול / תיקון / מחק (phrases) — bare "מחק" stays quick-undo */
 const INTENT_MANAGEMENT = [
   'ניהול', 'תיקון', 'תיקונים', 'נהל', 'עריכה', 'עריכת רשומות',
@@ -383,60 +389,194 @@ function detectDeleteIntent(lower, trimmed) {
 
 const CURRENCY_RE = /[$€]|דולר|אירו|euro|dollar/i;
 
-// ===================== Category mapping (Sheet = exactly these 5) =====================
+// ===================== 11 קטגוריות קיבוץ (שמות מלאים + אימוג׳י בשיטס) =====================
 
-const CANONICAL_CATEGORIES = ['חניה', 'נסיעות', 'אגרות', 'תקשורת', 'ציוד משרדי'];
+const CAT = {
+  psych: 'החזרי פסיכולוג 🧘',
+  health: 'החזרי בריאות 🩺',
+  parking: 'החזרי חנייה 🅿️',
+  transit: 'החזרי נסיעות תחבורה ציבורית 🚏',
+  hair: 'החזרי תספורת וקוסמטיקה 💇',
+  kids: 'החזרי ילדים 👶',
+  phone: 'החזרי טלפון 📱',
+  gov: 'החזרי תשלומים ממשלתיים 👩‍⚖️',
+  clothing: 'החזרי ביגוד לעובדי חוץ 👕',
+  building: 'החזרי בניין 🏡',
+  taxi: 'החזרי מוניות 🚕',
+};
 
-/** Multi-word phrases first so "כביש 6" wins over loose tokens */
+const CANONICAL_CATEGORIES = [
+  CAT.psych,
+  CAT.health,
+  CAT.parking,
+  CAT.transit,
+  CAT.hair,
+  CAT.kids,
+  CAT.phone,
+  CAT.gov,
+  CAT.clothing,
+  CAT.building,
+  CAT.taxi,
+];
+
+/** מילות מפתח (40+ לקטגוריה); ביטויים רב־מילים לפני טוקנים חופשיים */
 const CATEGORY_MAP = [
   {
-    category: 'חניה',
-    keywords: ['סלופארק', 'slopark', 'פנגו', 'pango', 'חניון', 'חנייה', 'חניה'],
+    category: CAT.psych,
+    keywords: [
+      'טיפול נפשי', 'טיפול פסיכולוגי', 'בריאות הנפש', 'ייעוץ נפשי', 'שיחה טיפולית', 'טיפול זוגי',
+      'טיפול משפחתי', 'טיפול דינמי', 'טיפול קבוצתי', 'פסיכותרפיה', 'פסיכולוגיה קלינית',
+      'cbt', 'קוגניטיבי התנהגותי', 'mindfulness', 'מיינדפולנס', 'היפנוזה קלינית',
+      'פוסט טראומה', 'ptsd', 'ocd', 'חרדה', 'דיכאון', 'אבחון נפשי', 'אבחון פסיכולוגי',
+      'פסיכולוג', 'פסיכולוגית', 'פסיכולוגיה', 'מטפל', 'מטפלת', 'פסיכיאטר', 'פסיכיאטריה',
+      'טיפול', 'נפשי', 'נפשית', 'פסיכולוגית', 'פסיכולוג', 'מטפלת', 'מטפל', 'פסיכיאטרית',
+      'פסיכיאטר', 'טיפול בילדים', 'טיפול מתבגרים', 'קבוצת תמיכה', 'טיפול באמנות',
+      'psychologist', 'therapy', 'therapist', 'psychiatry', 'מכון לבריאות הנפש',
+    ],
   },
   {
-    category: 'נסיעות',
-    keywords: ['נסיעות', 'נסיעה', 'יאנגו', 'yango', 'גט', 'gett', 'מונית', 'אוטובוס', 'רכבת', 'דלק', 'טאקסי', 'taxi'],
+    category: CAT.health,
+    keywords: [
+      'בית חולים', 'מרכז רפואי', 'מיון', 'אשפוז', 'ניתוח', 'מרפאה', 'קופת חולים', 'קופ"ח',
+      'ביקור רופא', 'רופא משפחה', 'רופא מומחה', 'מומחה', 'אורתופד', 'גינקולוג', 'גניקולוג',
+      'עור', 'אף אוזן גרון', 'עיניים', 'שיניים', 'סטומטולוג', 'דנטלי', 'פיזיותרפיה',
+      'רפואה משלימה', 'דיקור', 'כירופרקט', 'בדיקת דם', 'בדיקות דם', 'MRI', 'CT', 'רנטגן',
+      'אולטרסאונד', 'אולטרה סאונד', 'קליניקה', 'מרשם', 'תרופות', 'בית מרקחת', 'רוקחות',
+      'רפואה', 'בריאות', 'טיפול רפואי', 'אשפוז יום', 'מרפאת חוץ', 'מכון דימות', 'בדיקה רפואית',
+      'רופא', 'רופאה', 'אחות', 'אחיות', 'מעבדה רפואית', 'פיזיותרפיסט', 'קלינאית תקשורת',
+    ],
   },
   {
-    category: 'אגרות',
-    keywords: ['אגרות', 'הנתיב המהיר', 'חוצה צפון', 'כביש 6', 'כביש6', 'אגרה'],
+    category: CAT.parking,
+    keywords: [
+      'חניון', 'חנייה', 'חניה', 'חנית', 'תו חניה', 'תו חנייה', 'חניה בתשלום', 'שובר חניה',
+      'פנגו', 'pango', 'סלופארק', 'slopark', 'סלופרק', 'אפליקציית חניה', 'תשלום חניה',
+      'כחול לבן', 'חניון עירייה', 'חניון מקורה', 'חניון חיצוני', 'דיסק חניה', 'מטר חניה',
+      'חניית נכה', 'נכה חניה', 'אחסון רכב', 'חניון שדה', 'חניון קניון', 'חניון בית חולים',
+      'parking', 'park', 'חניית לילה', 'חניית שבת', 'חניון עבודה', 'חניון משרד',
+      'תו כחול', 'תו אזורי', 'חניון עירוני', 'חניון רב קומות', 'שער חניה', 'מחסום חניה',
+      'חניון אוטומטי', 'smart parking', 'סמארט פארק', 'חניית רחוב', 'חניה ברחוב',
+    ],
   },
   {
-    category: 'תקשורת',
-    keywords: ['תקשורת', 'חבילת גלישה', 'סים', 'sim', 'סלולר', 'אינטרנט'],
+    category: CAT.transit,
+    keywords: [
+      'תחבורה ציבורית', 'אוטובוס', 'רכבת', 'רכבת ישראל', 'רק"ל', 'רקל', 'מטרונית', 'קו אדום',
+      'קו ירוק', 'קו סגול', 'דן', 'דן באדס', 'אגד', 'אגד תעוברה', 'אגד תעבורה', 'מטרופולין',
+      'נתיב', 'קווים', 'קווי', 'רב קו', 'רב־קו', 'כרטיסיה', 'מונית שירות', 'מוניות שירות',
+      'שירות', 'קו לילה', 'קווי לילה', 'אפיקים', 'סופרבוס', 'מעברות', 'תחנת רכבת',
+      'תחנת אוטובוס', 'מסוף', 'מסוף רכבת', 'נתיב מהיר', 'מיניבוס ציבורי', 'שרותל',
+      'רכבת קלה', 'light rail', 'תשלום אוטובוס', 'תשלום רכבת', 'מנוי רכבת', 'מנוי אוטובוס',
+      'העלאה לאוטובוס', 'נסיעה באוטובוס', 'נסיעה ברכבת', 'תחבורה', 'ציבורית',
+    ],
   },
   {
-    category: 'ציוד משרדי',
-    keywords: ['ציוד משרדי', 'מקלדת', 'עכבר', 'נייר', 'דיו', 'משרד', 'ציוד'],
+    category: CAT.hair,
+    keywords: [
+      'תספורת', 'מספרה', 'ספר', 'ספרית', 'תספורת גברים', 'תספורת נשים', 'עיצוב שיער',
+      'צבע שיער', 'גוונים', 'הבהרה', 'תספורת ילדים', 'גילוח', 'זקן', 'טיפוח זקן',
+      'קוסמטיקאית', 'קוסמטיקה', 'טיפוח', 'סלון יופי', 'סלון', 'מניקור', 'פדיקור', 'לק',
+      'לק ג׳ל', 'ג׳ל', 'ציפורניים', 'הרמת ריסים', 'החלקה', 'טיפול פנים', 'פילינג', 'barber',
+      'hair', 'nails', 'manicure', 'pedicure', 'שעווה', 'שיזוף', 'סאונה יופי', 'מסכה לשיער',
+      'תסרוקת', 'איפור', 'איפור קבוע', 'עיצוב גבות', 'הדבקת ריסים',
+    ],
+  },
+  {
+    category: CAT.kids,
+    keywords: [
+      'גן ילדים', 'גן חובה', 'גן עירייה', 'מעון', 'מעון יום', 'צהרון', 'בייביסיטר', 'שמרטפית',
+      'קייטנה', 'קייטנת', 'חוג לילדים', 'חוגים לילדים', 'פעוטון', 'פעוטות', 'תינוק', 'תינוקות',
+      'בייבי', 'בייביסיטר', 'משחקייה', 'מסיבת ילדים', 'יום הולדת ילדים', 'מסיבת גן',
+      'ציוד לתינוק', 'חיתולים', 'מוצצים', 'בקבוקים', 'עגלת תינוק', 'מושב בטיחות', 'בטיחות ילדים',
+      'גן שעשועים', 'פארק שעשועים', 'אטרקציה לילדים', 'סדנת ילדים', 'קיץ לילדים', 'חוג ספורט ילדים',
+      'ילדים', 'ילד', 'ילדה', 'בן גן', 'בת גן', 'מסגרת חינוך', 'חינוך בוקר', 'פעילות לילדים',
+    ],
+  },
+  {
+    category: CAT.phone,
+    keywords: [
+      'סלולר', 'סלולאר', 'פלאפון', 'סלקום', 'פרטנר', 'גולן טלקום', 'הוט מובייל', 'hot mobile',
+      'וריץון', 'wecom', 'טלפון נייד', 'מכשיר', 'חבילת גלישה', 'גלישה', 'גיגה', 'GB', 'gb',
+      'סים', 'sim', 'esim', 'eSIM', 'החלפת מסך', 'תיקון טלפון', 'מנוי סלולר', 'חבילה משפחתית',
+      'שיחות', 'הודעות', 'וואטסאפ ביזנס', 'מספר וירטואלי', 'קו עסקי', 'טלפון', 'נייד',
+      'אינטרנט בטלפון', 'נטפליקס בנייד', 'חיבור סלולר', 'מודם סלולרי', 'רouter נייד',
+      'הארכת אחריות טלפון', 'ביטוח מכשיר', 'מכשיר חכם', 'סמארטפון', 'אייפון', 'אנדרואיד',
+    ],
+  },
+  {
+    category: CAT.gov,
+    keywords: [
+      'ביטוח לאומי', 'ביטוח הלאומי', 'תביעה לביטוח לאומי', 'תביעת ביטוח', 'קצבת ילדים',
+      'קצבת זקנה', 'קצבת נכות', 'דמי אבטלה', 'דמי מחלה', 'דמי לידה', 'חופשת לידה',
+      'מענק לידה', 'מענק עובדים', 'פיצוי פיטורין', 'פנסיה', 'קרן השתלמות', 'החזר ביטוח',
+      'החזר ממשלה', 'משרד הפנים', 'רשות האוכלוסין', 'אגרת רישוי', 'רישיון רכב', 'רישיון נהיגה',
+      'תשלום עירייה', 'ארנונה', 'היטל השבחה', 'הוצאות משפט מול רשות', 'עורך דין ממשלתי',
+      'גמלאות', 'גמלה', 'תגמולים', 'פיצויים מהמדינה', 'מענק חירום', 'סיוע ממשלתי',
+      'תשלום ממשלתי', 'משרד הרווחה', 'משרד הכלכלה', 'רשות המיסים החזר', 'מע״מ החזר',
+    ],
+  },
+  {
+    category: CAT.clothing,
+    keywords: [
+      'ביגוד עבודה', 'מדי עבודה', 'מדים', 'נעלי בטיח', 'נעלי עבודה', 'אפוד זוהר', 'אפוד רפלקטיבי',
+      'קסדה', 'קסדת עבודה', 'משקפי מגן', 'כפפות עבודה', 'כפפות בטיחות', 'מעיל עבודה', 'מכנס עבודה',
+      'חולצת עבודה', 'בגדי חוץ', 'ציוד מגן אישי', 'צמ״א', 'נעלי שטח', 'מגפי עבודה', 'סרבל',
+      'בגדים לעבודה בשטח', 'עובד חוץ', 'עובדי חוץ', 'ציוד בטיחות', 'בגדים מיוחדים לעבודה',
+      'מדי בטיחות', 'חגורת בטיחות', 'רתמה', 'נעלי סטילס', 'בגדים תרמיים לעבודה', 'מעיל חורף עבודה',
+      'ביגוד מגן', 'חליפת גשם עבודה', 'מסכת ריתוך', 'אוזניות מגן', 'אטמי אוזניים תעסוקתיים',
+      'מגפיים גבוהים', 'סוודר עבודה', 'חולצה מחממת לעבודה', 'בגדים לאתר', 'ציוד אתר',
+    ],
+  },
+  {
+    category: CAT.building,
+    keywords: [
+      'ועד בית', 'ועד הבית', 'אחזקת בניין', 'אחזקה משותפת', 'דירה', 'בניין מגורים', 'בית משותף',
+      'תיקון מעלית', 'מעלית', 'דוד שמש', 'דוד חשמלי', 'אינסטלטור בניין', 'חשמלאי בניין',
+      'נזילה בבניין', 'גג נזילה', 'מרפסת משותפת', 'גינה משותפת', 'שער חשמלי בניין', 'מצלמות בניין',
+      'ניקיון בניין', 'שיפוץ משותף', 'צביעת בניין', 'גג', 'קרן בניין', 'החזר ועד בית',
+      'הוצאות דיירים', 'אסיפת דיירים', 'ניהול בניין', 'חברת ניהול', 'דמי ניהול', 'ועד מתחם',
+      'תשלום בניין', 'תיקון גג', 'איטום גג', 'חיזוק מבנה', 'בטיחות בניין', 'מערכת סולארית משותפת',
+    ],
+  },
+  {
+    category: CAT.taxi,
+    keywords: [
+      'מונית', 'מוניות', 'נסיעה במונית', 'הזמנת מונית', 'מונית שירות פרטית', 'מונית פרטית',
+      'גט', 'gett', 'get taxi', 'יאנגו', 'yango', 'בול', 'בול מוניות', 'uber', 'יובר',
+      'קווי מוניות', 'מונית משרד', 'מונית לשדה', 'מונית לנתבג', 'מונית לבית חולים',
+      'מונית לעבודה', 'נסיעה עסקית במונית', 'נסיעת מונית', 'אפליקציית מוניות', 'הזמנה באפליקציה',
+      'מונית 24 שעות', 'מונית לילה', 'מונית שבת', 'מחיר מונית', 'מונה מונית', 'נסיעה מהירה',
+      'taxi', 'cab', 'מונית מיוחדת', 'מונית גדולה', 'מונית שרות פרטי', 'נסיעה דחופה במונית',
+    ],
   },
 ];
 
 const CLARIFY_CATEGORY_MSG =
-  '*בחר קטגוריה*\nשמע, הקבלה אצלי אבל לא נתפסתי לאן לשייך — כתוב מילה אחת: *חניה*, *נסיעות*, *אגרות*, *תקשורת* או *ציוד משרדי*. לא נותנים לכסף לברוח 🕵️‍♂️';
+  '*לא בטוח לאיזו קטגוריה זה נכנס* 🧐\nאחי, בוחרים מהרשימה — *לא מנחשים*, רק מחזירים כסף מהקיבוץ 💰';
 
-/** List-picker / payload id → Sheet category (must match CANONICAL_CATEGORIES) */
+/** List-picker id → שם מלא כמו בשיטס */
 const LIST_ITEM_ID_TO_CATEGORY = {
-  CAT_PARKING: 'חניה',
-  CAT_TRAVEL: 'נסיעות',
-  CAT_TOLLS: 'אגרות',
-  CAT_COMMS: 'תקשורת',
-  CAT_OFFICE: 'ציוד משרדי',
+  CAT_K_PSYCH: CAT.psych,
+  CAT_K_HEALTH: CAT.health,
+  CAT_K_PARK: CAT.parking,
+  CAT_K_TRANSIT: CAT.transit,
+  CAT_K_HAIR: CAT.hair,
+  CAT_K_KIDS: CAT.kids,
+  CAT_K_PHONE: CAT.phone,
+  CAT_K_GOV: CAT.gov,
+  CAT_K_CLOTH: CAT.clothing,
+  CAT_K_BUILD: CAT.building,
+  CAT_K_TAXI: CAT.taxi,
 };
 
 /** Quick-reply button payloads (inbound ButtonPayload) */
 const QR_PAYLOAD_SUMMARY = 'btn_summary';
 const QR_PAYLOAD_UNDO_LAST = 'btn_undo_last';
+const QR_PAYLOAD_CAT_YES = 'btn_cat_yes';
+const QR_PAYLOAD_CAT_NO = 'btn_cat_no';
 
 const CATEGORY_RETRY_MSG =
-  'לא נתפסתי… נסה מילה אחת: *חניה*, *נסיעות*, *אגרות*, *תקשורת* או *ציוד משרדי* 🍺';
-
-const CATEGORY_EMOJI = {
-  חניה: '🅿️',
-  נסיעות: '🚗',
-  אגרות: '🛣️',
-  תקשורת: '📱',
-  'ציוד משרדי': '🖊️',
-};
+  'לא נתפסתי… לוחצים על *בחר קטגוריה להחזר* מהרשימה, או כותבים מילה *מפורשת* (מונית / אוטובוס / פנגו…) — גבר, בלי ניחושים 💪';
 
 function normalizeCategoryText(s) {
   if (!s || typeof s !== 'string') return '';
@@ -447,26 +587,8 @@ function normalizeCategoryText(s) {
     .toLowerCase();
 }
 
-/** Levenshtein for fuzzy match (ASCII + Hebrew safe as string ops) */
-function levenshtein(a, b) {
-  if (a === b) return 0;
-  const m = a.length;
-  const n = b.length;
-  if (!m) return n;
-  if (!n) return m;
-  const row = Array.from({ length: n + 1 }, (_, j) => j);
-  for (let i = 1; i <= m; i++) {
-    let prevDiag = row[0];
-    row[0] = i;
-    for (let j = 1; j <= n; j++) {
-      const above = row[j] + 1;
-      const left = row[j - 1] + 1;
-      const diag = prevDiag + (a[i - 1] === b[j - 1] ? 0 : 1);
-      prevDiag = row[j];
-      row[j] = Math.min(above, left, diag);
-    }
-  }
-  return row[n];
+function stripCategoryEmojis(s) {
+  return String(s || '').replace(/\p{Extended_Pictographic}\uFE0F?/gu, '').replace(/\s+/g, ' ').trim();
 }
 
 function textIncludesPhrase(hayNorm, phraseNorm) {
@@ -474,17 +596,8 @@ function textIncludesPhrase(hayNorm, phraseNorm) {
   return hayNorm.includes(phraseNorm);
 }
 
-function fuzzyTokenMatch(tokenNorm, keywordNorm) {
-  if (!tokenNorm || !keywordNorm) return false;
-  if (tokenNorm === keywordNorm) return true;
-  if (keywordNorm.length <= 2) return false;
-  const maxDist = keywordNorm.length <= 4 ? 1 : 2;
-  return levenshtein(tokenNorm, keywordNorm) <= maxDist;
-}
-
 /**
- * Match description to one of CANONICAL_CATEGORIES, or null if unknown.
- * Uses substring (phrases), keyword tokens, Hebrew prefix strip, and light fuzzy match.
+ * מחזיר קטגוריה מלאה אחת או null אם אין התאמה או יש עמימות (לא מנחשים).
  */
 function matchCategory(description) {
   if (!description || typeof description !== 'string') return null;
@@ -499,33 +612,24 @@ function matchCategory(description) {
   const hay = `${lower} ${stripped}`;
   const hayNorm = normalizeCategoryText(hay);
 
+  const matched = new Set();
   for (const { category, keywords } of CATEGORY_MAP) {
     for (const kw of keywords) {
       const kn = normalizeCategoryText(kw);
+      if (!kn) continue;
       if (kn.includes(' ')) {
-        if (textIncludesPhrase(hayNorm, kn)) return category;
+        if (textIncludesPhrase(hayNorm, kn)) matched.add(category);
         continue;
       }
-      if (hayNorm.includes(kn)) return category;
+      if (hayNorm.includes(kn)) matched.add(category);
     }
   }
-
-  const tokens = hayNorm.split(/\s+/).filter(Boolean);
-  for (const { category, keywords } of CATEGORY_MAP) {
-    for (const kw of keywords) {
-      const kn = normalizeCategoryText(kw);
-      if (kn.includes(' ')) continue;
-      for (const tok of tokens) {
-        if (fuzzyTokenMatch(tok, kn)) return category;
-      }
-    }
-  }
-
+  if (matched.size === 1) return [...matched][0];
   return null;
 }
 
 /**
- * Resolve user's one-word (or short) reply to a canonical category name for the Sheet.
+ * תשובת משתמש אחרי רשימה / טקסט קצר — רק התאמה חד־משמעית (כולל שם מלא מהרשימה).
  */
 function resolveCategoryFromReply(text) {
   if (!text || typeof text !== 'string') return null;
@@ -541,47 +645,68 @@ function resolveCategoryFromReply(text) {
   const blobNorm = normalizeCategoryText(blob);
 
   for (const canon of CANONICAL_CATEGORIES) {
-    const cn = normalizeCategoryText(canon);
+    const cn = normalizeCategoryText(stripCategoryEmojis(canon));
     if (
       blobNorm === cn ||
-      trimmed === canon ||
-      trimmed.includes(canon) ||
-      blobNorm.includes(cn)
+      normalizeCategoryText(trimmed) === cn ||
+      blobNorm.includes(cn) ||
+      cn.includes(blobNorm)
     ) {
       return canon;
     }
   }
-  if (/ציוד|משרד|דיו|נייר|עכבר|מקלדת/i.test(trimmed)) return 'ציוד משרדי';
-  if (/תקשורת|סלולר|אינטרנט|סים|sim|גלישה/i.test(trimmed)) return 'תקשורת';
-  if (/אגר|כביש|נתיב|חוצה/i.test(trimmed)) return 'אגרות';
-  if (/נסיע|מונית|דלק|רכבת|אוטובוס|גט|gett|yango|יאנגו|טאקסי/i.test(trimmed)) return 'נסיעות';
-  if (/חניה|חנייה|חניון|פנגו|pango|סלופארק|slopark/i.test(trimmed)) return 'חניה';
-
-  const single = normalizeCategoryText(trimmed.split(/\s+/)[0] || trimmed);
-  for (const { category, keywords } of CATEGORY_MAP) {
-    for (const kw of keywords) {
-      const kn = normalizeCategoryText(kw);
-      if (kn.includes(' ')) continue;
-      if (fuzzyTokenMatch(single, kn)) return category;
-    }
-  }
-
-  for (const canon of CANONICAL_CATEGORIES) {
-    const cn = normalizeCategoryText(canon);
-    if (fuzzyTokenMatch(single, cn)) return canon;
-  }
-
-  return null;
+  return matchCategory(trimmed);
 }
 
 function categoryEmoji(description) {
   const cat = matchCategory(description);
   if (!cat) return '💰';
-  return CATEGORY_EMOJI[cat] || '💰';
+  const m = cat.match(/\p{Emoji_Presentation}\uFE0F?|\p{Extended_Pictographic}/gu);
+  return m && m.length ? m[m.length - 1] : '💰';
 }
 
 function confirmCategorySavedExact(category) {
-  return `סגור, רשמתי תחת ${category}. תודה!`;
+  return `יאללה סגור, רשמתי תחת ${category}. אלוף! 💪`;
+}
+
+/** Small talk / גישור רגשי → נידנוד לקטגוריה הרלוונטית */
+const BRIDGE_PSYCH = ['פסיכולוג', 'פסיכולוגית', 'מטפל', 'מטפלת', 'טיפול נפשי', 'חרדה', 'דיכאון', 'נפשי'];
+const BRIDGE_HEALTH = ['כואב', 'כאב', 'חולה', 'חולת', 'רופא', 'בית חולים', 'קופה', 'בריאות', 'חולים'];
+const BRIDGE_LOOKS = ['תספורת', 'מסתפר', 'מספרה', 'קוסמטיק', 'שיער', 'זקן', 'מראה'];
+const BRIDGE_DRIVE = ['נהג', 'נוהג', 'פקק', 'כביש', 'דרך', 'חניה בלי', 'תחבורה'];
+
+function tryBridgingSmallTalk(lower, trimmed) {
+  if (!trimmed || trimmed.length > 140) return null;
+  if (/\d/.test(trimmed)) return null;
+  const t = ` ${lower} `;
+  if (BRIDGE_PSYCH.some((k) => t.includes(k))) {
+    return (
+      `אחי, נשמע לא קל — אני פה בשביל להחזיר לך כסף מהקיבוץ 💪\n` +
+      `אם זה טיפול נפשי זה בדרך כלל *${CAT.psych}*, אם יותר רפואה קלאסית — *${CAT.health}*.\n` +
+      `שלח *סכום + מה זה היה + קבלה* ונסגור פינה 📸`
+    );
+  }
+  if (BRIDGE_HEALTH.some((k) => t.includes(k))) {
+    return (
+      `שומע אותך גבר, הבריאות קודמת 🩺\n` +
+      `קבלות מרופא / בית חולים / קופה — זה בכיוון *${CAT.health}*.\n` +
+      `כשיש לך סכום ופירוט, שולחים ואני דואג לשיטס 💰`
+    );
+  }
+  if (BRIDGE_LOOKS.some((k) => t.includes(k))) {
+    return (
+      `יאללה, ליטוש מראה זה לגיטימי 💇\n` +
+      `אם יש קבלה — זה *${CAT.hair}*. שלח *סכום + תיאור* ונכניס לרשימה 📋`
+    );
+  }
+  if (BRIDGE_DRIVE.some((k) => t.includes(k))) {
+    return (
+      `הכבישים זה אתגר, אני מכיר 🚗\n` +
+      `*${CAT.taxi}* = מוניות / אפליקציות; *${CAT.transit}* = אוטובוס / רכבת / רב־קו; *${CAT.parking}* = חנייה / פנגו.\n` +
+      `תן לי *סכום + מה בדיוק* ולא מפספסים 💰`
+    );
+  }
+  return null;
 }
 
 async function startCategoryClarification(res, phone, pick, opts = {}) {
@@ -689,7 +814,7 @@ function emptyTwiMLResponse(res) {
 }
 
 const MEDIA_PROCESSING_ACK_MSG =
-  'קיבלתי! רגע, אני מעלה את זה לדרייב ורושם לך הכל שלא ילך לאיבוד... 🕵️‍♂️';
+  'יאללה קיבלתי 📸 רגע מעלה לדרייב ורושם בשיטס — השקלים לא בורחים, אחי 💪';
 
 /** WhatsApp typing indicator (Twilio v2 beta). Requires inbound MessageSid / SmsSid. */
 async function sendWhatsAppTypingIndicator(messageSid) {
@@ -760,22 +885,34 @@ function clipWhatsAppListField(s, max) {
 
 function categoryListPickerItems() {
   const meta = {
-    חניה: 'חנייה, פנגו, חניון',
-    נסיעות: 'מונית, דלק, תחבורה',
-    אגרות: 'כביש, נתיב, חוצה ישראל',
-    תקשורת: 'סלולר, אינטרנט',
-    'ציוד משרדי': 'משרד, ציוד',
+    [CAT.psych]: 'טיפול, מטפל, פסיכולוג',
+    [CAT.health]: 'רופא, בית חולים, קופה',
+    [CAT.parking]: 'חניון, פנגו, סלופארק',
+    [CAT.transit]: 'אוטובוס, רכבת, רב־קו',
+    [CAT.hair]: 'תספורת, קוסמטיקה, סלון',
+    [CAT.kids]: 'גן, מעון, צהרון, קייטנה',
+    [CAT.phone]: 'סלולר, חבילה, סים',
+    [CAT.gov]: 'ביטוח לאומי, קצבאות, מענקים',
+    [CAT.clothing]: 'מדי עבודה, בטיחות, צמ״א',
+    [CAT.building]: 'ועד בית, אחזקה, מעלית',
+    [CAT.taxi]: 'מונית, גט, יאנגו, בול',
   };
   const idByCat = {
-    חניה: 'CAT_PARKING',
-    נסיעות: 'CAT_TRAVEL',
-    אגרות: 'CAT_TOLLS',
-    תקשורת: 'CAT_COMMS',
-    'ציוד משרדי': 'CAT_OFFICE',
+    [CAT.psych]: 'CAT_K_PSYCH',
+    [CAT.health]: 'CAT_K_HEALTH',
+    [CAT.parking]: 'CAT_K_PARK',
+    [CAT.transit]: 'CAT_K_TRANSIT',
+    [CAT.hair]: 'CAT_K_HAIR',
+    [CAT.kids]: 'CAT_K_KIDS',
+    [CAT.phone]: 'CAT_K_PHONE',
+    [CAT.gov]: 'CAT_K_GOV',
+    [CAT.clothing]: 'CAT_K_CLOTH',
+    [CAT.building]: 'CAT_K_BUILD',
+    [CAT.taxi]: 'CAT_K_TAXI',
   };
   return CANONICAL_CATEGORIES.map((cat) => ({
     item: clipWhatsAppListField(cat, 24),
-    description: clipWhatsAppListField(meta[cat] || cat, 72),
+    description: clipWhatsAppListField(meta[cat] || 'החזר מהקיבוץ', 72),
     id: idByCat[cat],
   }));
 }
@@ -819,18 +956,18 @@ async function postTwilioContentTemplate(payload) {
 }
 
 async function createReceiptQuickReplyTemplate() {
-  const t1 = 'סיכום חודשי 📊';
-  const t2 = 'מחיקה 🗑️';
+  const t1 = 'סיכום החזרים 📊';
+  const t2 = 'מחיקת אחרון 🗑️';
   const payload = {
     friendly_name: CONTENT_FN_RECEIPT_QR,
     language: 'he',
     variables: { 1: 'אישור רישום' },
     types: {
       'twilio/text': {
-        body: '{{1}}\n\n*מה הלאה?* סיכום חודשי או מחיקה — אפשר גם *סיכום* / *מחק*. החבר החכם כאן 🍺',
+        body: '{{1}}\n\n*מה עושים עכשיו?* *סיכום החזרים* או *מחיקת אחרון* — או פשוט כותבים *סיכום* / *מחק*. אחי, אני איתך 💪',
       },
       'twilio/quick-reply': {
-        body: '{{1}}\n\n*מה עושים עכשיו?* שתי הקשות למטה — או במילים, בלי בושה 🕵️‍♂️',
+        body: '{{1}}\n\n*יאללה מה הלאה?* שתי הקשות למטה — או במילים, בלי בושה 💰',
         actions: [
           { type: 'QUICK_REPLY', title: clipWhatsAppButtonTitle(t1, 20), id: QR_PAYLOAD_SUMMARY },
           { type: 'QUICK_REPLY', title: clipWhatsAppButtonTitle(t2, 20), id: QR_PAYLOAD_UNDO_LAST },
@@ -852,11 +989,11 @@ async function createCategoryListTemplate() {
     language: 'he',
     types: {
       'twilio/text': {
-        body: '*בחר קטגוריה*\nשמע, לא נתפסתי לאן לשייך — בוחרים מהרשימה ואני סוגר לך את הפינה 🍺',
+        body: '*בחר קטגוריה להחזר*\nאלופה, לא ניחשתי — בוחרים מהרשימה וסוגרים פינה עם הקיבוץ 💰',
       },
       'twilio/list-picker': {
-        body: '*בחר קטגוריה*\nלא בטוח איפה זה יושב? לוחצים על הכפתור — והכסף לא הולך לאיבוד 💰',
-        button: 'בחר קטגוריה',
+        body: '*בחר קטגוריה להחזר*\nלא בטוחים? לוחצים על הכפתור — והשקלים חוזרים אליך 💪',
+        button: clipWhatsAppButtonTitle('בחר קטגוריה להחזר', 20),
         items: categoryListPickerItems(),
       },
     },
@@ -869,6 +1006,37 @@ async function createCategoryListTemplate() {
   return sid;
 }
 
+async function createCategoryConfirmTemplate() {
+  const payload = {
+    friendly_name: CONTENT_FN_CATEGORY_CONFIRM,
+    language: 'he',
+    variables: { 1: 'שאלה' },
+    types: {
+      'twilio/quick-reply': {
+        body: '{{1}}',
+        actions: [
+          {
+            type: 'QUICK_REPLY',
+            title: clipWhatsAppButtonTitle('כן, זה הקטגוריה ✅', 20),
+            id: QR_PAYLOAD_CAT_YES,
+          },
+          {
+            type: 'QUICK_REPLY',
+            title: clipWhatsAppButtonTitle('לא, שנה לי ✏️', 20),
+            id: QR_PAYLOAD_CAT_NO,
+          },
+        ],
+      },
+    },
+  };
+  let sid = await postTwilioContentTemplate(payload);
+  if (!sid) {
+    const m = await fetchContentFriendlyNameToSid();
+    sid = m.get(CONTENT_FN_CATEGORY_CONFIRM) || '';
+  }
+  return sid;
+}
+
 async function initializeWhatsAppContentTemplates() {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
   try {
@@ -877,11 +1045,15 @@ async function initializeWhatsAppContentTemplates() {
     if (!contentSidReceiptQr) contentSidReceiptQr = await createReceiptQuickReplyTemplate();
     if (!contentSidCategoryList) contentSidCategoryList = byName.get(CONTENT_FN_CATEGORY_LIST) || '';
     if (!contentSidCategoryList) contentSidCategoryList = await createCategoryListTemplate();
+    if (!contentSidCategoryConfirm) contentSidCategoryConfirm = byName.get(CONTENT_FN_CATEGORY_CONFIRM) || '';
+    if (!contentSidCategoryConfirm) contentSidCategoryConfirm = await createCategoryConfirmTemplate();
     console.log(
       '[config] Twilio Content SIDs:',
       contentSidReceiptQr ? `${contentSidReceiptQr.slice(0, 8)}…` : '(receipt QR off)',
       '|',
-      contentSidCategoryList ? `${contentSidCategoryList.slice(0, 8)}…` : '(category list off)'
+      contentSidCategoryList ? `${contentSidCategoryList.slice(0, 8)}…` : '(category list off)',
+      '|',
+      contentSidCategoryConfirm ? `${contentSidCategoryConfirm.slice(0, 8)}…` : '(cat confirm off)'
     );
   } catch (e) {
     console.warn('[twilio-content] initialize:', e.message);
@@ -921,7 +1093,7 @@ async function sendReceiptSuccessQuickReply(waNorm, confirmationBody) {
   if (!contentSidReceiptQr) {
     await replyWhatsAppToUser(
       waNorm,
-      `${confirmationBody}\n\n*מה הלאה?*\n• *סיכום חודשי* — כתוב *סיכום*\n• *מחיקה* — כתוב *מחק* (או כפתור כשמופיע)\nהחבר החכם לא שופט, רק שומר על הכיס 🕵️‍♂️`
+      `${confirmationBody}\n\n*מה הלאה?*\n• *סיכום החזרים* — כתוב *סיכום*\n• *מחיקת אחרון* — כתוב *מחק*\nאחי, רק מחזירים כסף מהקיבוץ 💪`
     );
     return;
   }
@@ -952,22 +1124,42 @@ function parseInboundInteractive(req) {
 
 // ===================== Google Sheets =====================
 
-const SHEET_HEADERS = [
-  'Date', 'Description', 'Amount', 'Category', 'Receipt', 'Submitted', 'Time', 'ReceiptImage', 'User',
+const SHEET_HEADERS_PREFERRED = [
+  'Date', 'Amount', 'Category', 'Drive_Link', 'Status', 'Notes', 'User',
 ];
 
 async function ensureHeaders(sheet) {
   await sheet.loadHeaderRow(1);
   const h = sheet.headerValues || [];
   if (h.filter(Boolean).length === 0) {
-    await sheet.setHeaderRow(SHEET_HEADERS);
+    await sheet.setHeaderRow(SHEET_HEADERS_PREFERRED);
     return;
   }
   if (!h.includes('User')) {
     console.warn(
-      '[sheet] Add a "User" header in column I (or extend row 1) so multi-user rows can be stored and filtered.'
+      '[sheet] הוסף עמודת "User" בשורת כותרות לסינון רב־משתמשים.'
     );
   }
+}
+
+function sheetNotes(row) {
+  return String(getCol(row, 'Notes') || getCol(row, 'Description') || '').trim();
+}
+
+function sheetDriveLink(row) {
+  return String(getCol(row, 'Drive_Link') || getCol(row, 'ReceiptImage') || '').trim();
+}
+
+function sheetStatusIsRefunded(row) {
+  const st = String(getCol(row, 'Status') || '').trim();
+  if (st && /refunded|הוחזר/i.test(st)) return true;
+  if (String(getCol(row, 'Submitted') || '').trim() === 'Yes') return true;
+  return false;
+}
+
+function rowHasReceiptAttachment(row) {
+  if (sheetDriveLink(row)) return true;
+  return String(getCol(row, 'Receipt') || '').trim() === 'Yes';
 }
 
 function formatNow() {
@@ -988,25 +1180,86 @@ function getCol(row, col) {
   return (typeof row.get === 'function' ? row.get(col) : row[col]) || '';
 }
 
-async function appendExpenseRow(description, amount, category, receipt, receiptImage, userValue) {
+async function appendExpenseRow(notes, amount, category, driveLink, userValue) {
   const doc = await getSpreadsheetDoc();
   if (!doc) return null;
   const sheet = doc.sheetsByIndex[0];
   await ensureHeaders(sheet);
+  await sheet.loadHeaderRow(1);
+  const headers = sheet.headerValues || [];
   const { date, time } = formatNow();
-  const row = await sheet.addRow({
+  const dl = (driveLink || '').trim();
+  const full = {
     Date: date,
-    Description: description,
     Amount: amount,
     Category: category,
-    Receipt: receipt || '',
+    Drive_Link: dl,
+    Status: 'Pending',
+    Notes: notes || '',
+    User: userValue || '',
+    Description: notes || '',
+    Receipt: dl ? 'Yes' : 'No',
     Submitted: 'No',
     Time: time,
-    ReceiptImage: receiptImage || '',
-    User: userValue || '',
-  });
+    ReceiptImage: dl,
+  };
+  const rowObj = {};
+  for (const [k, v] of Object.entries(full)) {
+    if (headers.includes(k)) rowObj[k] = v;
+  }
+  if (Object.keys(rowObj).length === 0) {
+    console.error('[sheets] אין כותרות תואמות בשורה 1 — בדוק את הגיליון');
+    return null;
+  }
+  const row = await sheet.addRow(rowObj);
   console.log('[sheets] Sheet row added:', row ? `rowNumber=${row.rowNumber}` : '(null)');
   return row;
+}
+
+async function hasDuplicateDateAmount(ownerWaNorm, dateStr, amount) {
+  const data = await getCurrentMonthRows(false, ownerWaNorm);
+  if (!data) return false;
+  const t = parseFloat(amount);
+  if (Number.isNaN(t)) return false;
+  return data.rows.some((r) => r.date === dateStr && Math.abs(r.amt - t) < 0.009);
+}
+
+async function duplicateExpenseWarningLine(ownerWaNorm, amount) {
+  const { date } = formatNow();
+  const hit = await hasDuplicateDateAmount(ownerWaNorm, date, amount);
+  return hit
+    ? '\n\n⚠️ *אחי,* כבר יש רישום באותו יום באותו סכום — וודא שזו לא כפילות.'
+    : '';
+}
+
+/** עדכון קישור דרייב + שדות ישנים (Receipt / ReceiptImage) לפי כותרות קיימות */
+async function updateRowDriveAndLegacy(rowIndex, ownerWaNorm, driveLink) {
+  const doc = await getSpreadsheetDoc();
+  if (!doc) return false;
+  const sheet = doc.sheetsByIndex[0];
+  await ensureHeaders(sheet);
+  await sheet.loadHeaderRow(1);
+  const headers = sheet.headerValues || [];
+  const dl = (driveLink || '').trim();
+  const updates = {};
+  if (headers.includes('Drive_Link')) updates.Drive_Link = dl;
+  if (headers.includes('ReceiptImage')) updates.ReceiptImage = dl;
+  if (headers.includes('Receipt')) updates.Receipt = dl ? 'Yes' : 'No';
+  if (Object.keys(updates).length === 0) return false;
+  return updateMultipleFieldsByIndexForOwner(rowIndex, updates, ownerWaNorm);
+}
+
+async function updateRowReceiptFlagOnly(rowIndex, ownerWaNorm, hasReceipt) {
+  const doc = await getSpreadsheetDoc();
+  if (!doc) return false;
+  const sheet = doc.sheetsByIndex[0];
+  await ensureHeaders(sheet);
+  await sheet.loadHeaderRow(1);
+  const headers = sheet.headerValues || [];
+  const updates = {};
+  if (headers.includes('Receipt')) updates.Receipt = hasReceipt ? 'Yes' : 'No';
+  if (Object.keys(updates).length === 0) return false;
+  return updateMultipleFieldsByIndexForOwner(rowIndex, updates, ownerWaNorm);
 }
 
 async function updateRowField(row, field, value) {
@@ -1133,7 +1386,6 @@ async function saveToSheet(description, amount, category, userSheetValue) {
     parseFloat(amount) || 0,
     category,
     '',
-    '',
     userSheetValue || ''
   );
 }
@@ -1153,10 +1405,14 @@ async function getRowsForMonth(targetYear, targetMonth, includeRaw, ownerWaNorm)
     const userCell = getCol(row, 'User');
     if (ownerWaNorm && !userCellMatchesOwner(userCell, ownerWaNorm)) continue;
     const entry = {
-      amt, cat: getCol(row, 'Category') || '',
-      desc: getCol(row, 'Description'), receipt: getCol(row, 'Receipt'),
-      submitted: getCol(row, 'Submitted'), date: getCol(row, 'Date'),
-      time: getCol(row, 'Time'), receiptImage: getCol(row, 'ReceiptImage'),
+      amt,
+      cat: getCol(row, 'Category') || '',
+      desc: sheetNotes(row),
+      receipt: rowHasReceiptAttachment(row) ? 'Yes' : 'No',
+      submitted: sheetStatusIsRefunded(row) ? 'Yes' : 'No',
+      date: getCol(row, 'Date'),
+      time: getCol(row, 'Time'),
+      receiptImage: sheetDriveLink(row),
       user: userCell,
     };
     if (includeRaw) entry.row = row;
@@ -1196,12 +1452,18 @@ async function getUnsubmittedRows(ownerWaNorm) {
 async function markAllCurrentMonthSubmitted(ownerWaNorm) {
   const data = await getCurrentMonthRows(true, ownerWaNorm);
   if (!data) return 0;
+  const doc = await getSpreadsheetDoc();
+  if (!doc) return 0;
+  const sheet = doc.sheetsByIndex[0];
+  await ensureHeaders(sheet);
+  await sheet.loadHeaderRow(1);
+  const headers = sheet.headerValues || [];
   let count = 0;
   for (const entry of data.rows) {
-    if (entry.submitted !== 'Yes' && entry.row) {
-      await updateRowField(entry.row, 'Submitted', 'Yes');
-      count++;
-    }
+    if (!entry.row || sheetStatusIsRefunded(entry.row)) continue;
+    if (headers.includes('Status')) await updateRowField(entry.row, 'Status', 'Refunded');
+    if (headers.includes('Submitted')) await updateRowField(entry.row, 'Submitted', 'Yes');
+    count++;
   }
   return count;
 }
@@ -1257,6 +1519,7 @@ function formatShekelDisplay(n) {
 }
 
 function sumCategoryTotalsMap(totalsMap) {
+  if (!totalsMap || typeof totalsMap.values !== 'function') return 0;
   let s = 0;
   for (const v of totalsMap.values()) s += v;
   return s;
@@ -1297,34 +1560,40 @@ function formatMoMTotalInsight(curTotal, prevTotal, prevMonthName) {
   return `זה *${Math.abs(pct)}%* פחות מ*${prevMonthName}* — אולי חודש רגוע, אולי עוד נסגור פינות 😉`;
 }
 
-/** Top spending category — Savvy Friend “deep insight” (emoji matches persona). */
+/** תובנה על הקטגוריה המובילה — טון קיבוץ */
 function savvyDeepInsightTopCategory(topCategory, topAmount, grandTotal) {
   if (!topCategory || grandTotal <= 0) return '';
   const share = Math.max(1, Math.round((topAmount / grandTotal) * 100));
-  switch (topCategory) {
-    case 'נסיעות':
-      return `שים לב, החודש *המוניות והנסיעות* 🚕 תפסו נתח גדול (*כ-${share}%* מהסכום) — שווה לוודא שכל נסיעה עם קבלה חוזרת אליך.`;
-    case 'חניה':
-      return `*חניה* 🅿️ דווקא בולטת החודש (*~${share}%*) — פנגו, חניונים וכו׳ מצטברים בלי לשים לב; רשמתי הכול כדי שלא תפספס שקל.`;
-    case 'אגרות':
-      return `*אגרות וכביש* 🛣️ לקחו חלק יפה מהעוגה החודש — בול, ככה שומרים על הזכות להחזר ולא נותנים למדינה “הלוואה חינם”.`;
-    case 'תקשורת':
-      return `*תקשורת* 📱 בולטת החודש — סים, סלולר, נטו; העיקר שהמערכת תחזיר מה שמגיע לך על כל שורה.`;
-    case 'ציוד משרדי':
-      return `*ציוד משרדי* 🖊️ קיבל תשומת לב החודש — שווה לוודא שכל קנייה קטנה גם כן מגיעה לרשימת המגיע לי.`;
-    case 'בריאות':
-      return `השקעת *הרבה בבריאות* 🩺 החודש — הכי חשוב! רשמתי הכול כדי שהקיבוץ (או המעסיק) יחזיר לך כל שקל שמגיע.`;
-    default:
-      return `*${topCategory}* תופסת כ-*~${share}%* מהסכום החודשי — שווה לעין על זה שהכל מוגש בזמן 💰`;
-  }
+  const byCat = {
+    [CAT.taxi]: `החודש *מוניות* 🚕 תופסות נתח שמע (*~${share}%*) — שווה לוודא שלכל נסיעה יש קבלה, אחי.`,
+    [CAT.transit]: `*תחבורה ציבורית* 🚏 בולטת (*~${share}%*) — רב־קו ואוטובוסים מצטברים, שומרים על הכול בשיטס 💪`,
+    [CAT.parking]: `*חניה* 🅿️ דווקא בולטת (*~${share}%*) — פנגו וחניונים, לא נותנים לזה לברוח בלי קבלה.`,
+    [CAT.phone]: `*סלולר וטלפון* 📱 תופסים (*~${share}%*) — חבילות ומנויים, מחזירים מהקיבוץ כל שקל שמגיע.`,
+    [CAT.health]: `*בריאות* 🩺 משמעותי החודש (*~${share}%*) — הכי חשוב שיש; רשום הכול כדי לגבות מהקיבוץ.`,
+    [CAT.psych]: `*טיפול ופסיכולוג* 🧘 בולט (*~${share}%*) — שומרים עליך ועל הכיס, עם קבלות מסודרות.`,
+    [CAT.hair]: `*תספורת וקוסמטיקה* 💇 עלו החודש (*~${share}%*) — לגיטימי, רק עם קבלות נקיות.`,
+    [CAT.kids]: `*ילדים* 👶 תופסים חלק (*~${share}%*) — גן, מעון, חוגים — מחזירים מה שמגיע למשפחה.`,
+    [CAT.gov]: `*תשלומים ממשלתיים* 👩‍⚖️ בולטים (*~${share}%*) — ביטוח לאומי וכו׳, שווה לעקוב שהכול הוגש.`,
+    [CAT.clothing]: `*ביגוד לעובדי חוץ* 👕 (*~${share}%*) — ציוד ובטיחות, אל תוותר על קבלות.`,
+    [CAT.building]: `*בניין וועד בית* 🏡 (*~${share}%*) — אחזקות משותפות, מחזירים מה שמגיע לדיירים.`,
+  };
+  return (
+    byCat[topCategory] ||
+    `*${topCategory}* תופסת כ-*~${share}%* מהסכום החודשי — עין על הקבלות וההגשות, גבר 💰`
+  );
 }
 
 const QUICKCHART_BASE = 'https://quickchart.io/chart';
 
-/** Pastel palette (exact order for slice assignment by sort index) */
-const MONTHLY_DOUGHNUT_PASTELS = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF'];
+/** פלטת פסטל לעד 11 פרוסות */
+const MONTHLY_DOUGHNUT_PASTELS = [
+  '#FFB5C2', '#B5D8FF', '#C9F2C7', '#FFE4A8', '#D4C4F5', '#FFD4A3', '#A8E6E3', '#E8B5D1',
+  '#C4E8F5', '#D9F0C4', '#F5E6B8',
+];
 
-const SUMMARY_CHART_WHATSAPP_CAPTION = 'הנה הגרף שלך!  תראה איפה הכסף שלך נמצא.';
+function summaryChartCaptionShekels(totalDisplay) {
+  return `הנה פילוח ההחזרים שלך. הקיבוץ חייב לך ${totalDisplay} ש"ח! 💰`;
+}
 
 /** One-time PNG blobs for Twilio MediaUrl when PUBLIC_WEBHOOK_BASE is set */
 const chartPngOneShot = new Map();
@@ -1340,7 +1609,7 @@ function buildMonthlySummaryDoughnutChartJs(entries) {
     .map((_, i) => JSON.stringify(MONTHLY_DOUGHNUT_PASTELS[i % MONTHLY_DOUGHNUT_PASTELS.length]))
     .join(',');
   const titleStr = JSON.stringify('פילוח ההחזרים חודשי 📊');
-  return `{type:'doughnut',data:{labels:[${labelsJson}],datasets:[{data:[${dataStr}],backgroundColor:[${bgStr}],borderWidth:2,borderColor:'#ffffff'}]},options:{cutoutPercentage:62,legend:{position:'bottom',rtl:true,labels:{fontFamily:'Varela Round, Noto Sans Hebrew',fontColor:'#1e293b',fontSize:13,padding:16,usePointStyle:true,boxWidth:10}},title:{display:true,text:${titleStr},fontFamily:'Varela Round, Noto Sans Hebrew',fontSize:18,fontColor:'#0f172a',fontStyle:'bold',padding:20},plugins:{datalabels:{display:true,color:'#ffffff',font:{weight:'bold',size:16,family:'Varela Round, Arial'},textStrokeColor:'rgba(15,23,42,0.4)',textStrokeWidth:3,formatter:(value,ctx)=>{var arr=ctx.dataset.data,s=0,i;for(i=0;i<arr.length;i++)s+=arr[i];if(!s)return'';var p=Math.round((value/s)*100);return p<4?'':(p+'%');}}}}}`;
+  return `{type:'doughnut',data:{labels:[${labelsJson}],datasets:[{data:[${dataStr}],backgroundColor:[${bgStr}],borderWidth:2,borderColor:'#ffffff'}]},options:{cutoutPercentage:62,legend:{position:'bottom',rtl:true,labels:{fontFamily:'Varela Round, Noto Sans Hebrew',fontColor:'#334155',fontSize:12,padding:14,usePointStyle:true,boxWidth:10}},title:{display:true,text:${titleStr},fontFamily:'Varela Round, Noto Sans Hebrew',fontSize:17,fontColor:'#0f172a',fontStyle:'bold',padding:18},plugins:{datalabels:{display:true,color:'#ffffff',font:{weight:'bold',size:15,family:'Varela Round, Noto Sans Hebrew, Arial'},textStrokeColor:'rgba(15,23,42,0.35)',textStrokeWidth:2,formatter:(value,ctx)=>{var arr=ctx.dataset.data,s=0,i;for(i=0;i<arr.length;i++)s+=arr[i];if(!s)return'';var p=Math.round((value/s)*100);return p<4?'':(p+'%');}}}}}`;
 }
 
 async function fetchQuickChartPngBuffer(chartJsString) {
@@ -1380,14 +1649,15 @@ function registerChartPngOneShotUrl(buffer) {
   return `${PUBLIC_WEBHOOK_BASE}/__media/chart/${token}`;
 }
 
-async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap) {
-  const entries = [...categoryTotalsMap.entries()]
+async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap, totalShekels) {
+  const map = categoryTotalsMap && typeof categoryTotalsMap.entries === 'function' ? categoryTotalsMap : new Map();
+  const entries = [...map.entries()]
     .filter(([, amt]) => amt > 0)
     .sort((a, b) => b[1] - a[1]);
   if (entries.length === 0) return;
 
   const chartJs = buildMonthlySummaryDoughnutChartJs(entries);
-  const caption = SUMMARY_CHART_WHATSAPP_CAPTION;
+  const caption = summaryChartCaptionShekels(formatShekelDisplay(totalShekels));
 
   try {
     const png = await fetchQuickChartPngBuffer(chartJs);
@@ -1412,7 +1682,7 @@ async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap) {
 
   await replyWhatsAppToUser(
     waNorm,
-    'שמע, הגרף לא עלה הפעם — המספרים בהודעה הקודמת בכל זאת מדויקים. אם יש לך כתובת ציבורית לשרת, הגדר *PUBLIC_WEBHOOK_BASE* לשליחת תמונה יציבה 🕵️‍♂️'
+    'אחי, הגרף לא עלה הפעם — המספרים בהודעה הקודמת עדיין מדויקים. אם יש *PUBLIC_WEBHOOK_BASE*, נשלח תמונה יציבה יותר 💪'
   );
 }
 
@@ -1432,6 +1702,7 @@ async function buildVisualSummaryPackage(ownerWaNorm) {
       firstMessage:
         `הנה סיכום ההחזרים שלך לחודש זה: סה״כ *0* ש״ח.\n${comparison}\n\nאין עדיין רישומים החודש — שלח אחד ונצייר לך עוגה אמיתית 🍰`,
       chartUrl: null,
+      categoryTotals: agg.curByCategory || new Map(),
     };
   }
 
@@ -1456,7 +1727,9 @@ async function sendVisualMonthlySummary(res, waNorm) {
     return;
   }
   sendTwiML(res, pkg.firstMessage);
-  await sendMonthlySummaryChartToWhatsApp(waNorm, pkg.categoryTotals);
+  const totalsMap = pkg.categoryTotals && typeof pkg.categoryTotals.entries === 'function' ? pkg.categoryTotals : new Map();
+  const chartTotal = sumCategoryTotalsMap(totalsMap);
+  await sendMonthlySummaryChartToWhatsApp(waNorm, totalsMap, chartTotal);
 }
 
 const SUMMARY_FOOTERS = [
@@ -1497,7 +1770,8 @@ async function buildMonthlySummary(ownerWaNorm) {
   lines.push('─────────────────────');
 
   for (const [cat, total] of [...categoryTotals.entries()].sort((a, b) => b[1] - a[1])) {
-    const emoji = CATEGORY_EMOJI[cat] || cat.match(/\p{Emoji_Presentation}/u)?.[0] || '•';
+    const emoji =
+      (cat.match(/\p{Emoji_Presentation}\uFE0F?|\p{Extended_Pictographic}/gu) || []).slice(-1)[0] || '•';
     lines.push(`${emoji} *${cat}*: ${total} ₪`);
     const items = categoryItems.get(cat) || [];
     if (items.length > 1) {
@@ -1604,6 +1878,7 @@ const EXPENSE_INTERACTIVE_STATES = new Set([
   'AWAITING_RECEIPT_IMAGE',
   'AWAITING_EXPENSE_DETAILS',
   'AWAITING_CATEGORY_CLARIFICATION',
+  'AWAITING_CATEGORY_CONFIRM',
   'AWAITING_DAILY_REPLY',
 ]);
 
@@ -1612,7 +1887,8 @@ const EXPENSE_INTERACTIVE_STATES = new Set([
  *   IDLE, AWAITING_DESCRIPTION, AWAITING_AMOUNT, AWAITING_HIGH_CONFIRM,
  *   AWAITING_RECEIPT_IMAGE  — text-first: waiting for image or כן/לא (5 min)
  *   AWAITING_EXPENSE_DETAILS — image-first: waiting for text (amount+desc)
- *   AWAITING_CATEGORY_CLARIFICATION — תיאור בלי מילת מפתח לקטגוריה (5 קטגוריות)
+ *   AWAITING_CATEGORY_CLARIFICATION — רשימת 11 קטגוריות
+ *   AWAITING_CATEGORY_CONFIRM — אישור קטגוריה אחרי זיהוי אוטומטי
  *   AWAITING_DAILY_REPLY
  *   AWAITING_DELETE_SELECTION / AWAITING_DELETE_CONFIRM — guided delete (2 min TTL)
  *   MANAGEMENT_* — full-month edit flow (10 min TTL)
@@ -1728,9 +2004,9 @@ async function refreshManagementEditSnapshot(phone, waNorm) {
   const entry = {
     sheetRowNumber: rowNum,
     date: getCol(row, 'Date'),
-    desc: getCol(row, 'Description'),
+    desc: sheetNotes(row),
     amt: parseFloat(getCol(row, 'Amount')) || 0,
-    receiptImage: getCol(row, 'ReceiptImage'),
+    receiptImage: sheetDriveLink(row),
   };
   us.managementEditRow = entry;
   return entry;
@@ -1794,28 +2070,87 @@ function confirmWithImageMsg(amount, desc, category) {
   return (
     `*סגרנו — הקבלה בפנים* ✅\n` +
     `${savvySuccessDriveAndSheets(amount)}\n` +
-    `*קטגוריה:* ${category} 🍺\n` +
-    `טעות? *מחק* או *טעות* — נעשה סדר, לא נותנים לכסף לברוח 🕵️‍♂️`
+    `*קטגוריה:* ${category}\n` +
+    `טעות? *מחק* — לא מזרימים כסף לריק, גבר 💪`
   );
 }
 
-function confirmTextFirstMsg(amount, desc, category) {
+function confirmTextFirstMsg(amount, desc, category, dupSuffix = '') {
   return (
-    `*נרשם — עוד כסף ברשימה* 💰\n` +
-    `קלטתי *${amount} ₪* על *${desc}*, תחת *${category}*.\n\n` +
-    `יש קבלה? שלח תמונה או ענה *כן* / *לא* — אל תפספס החזר 📸\n` +
-    `משהו לא מדויק? *מחק* או *טעות*. החבר החכם כאן 🕵️‍♂️`
+    `*נרשם — עוד כסף שחוזר מהקיבוץ* 💰\n` +
+    `קלטתי *${amount} ₪* על *${desc}*, תחת *${category}*.${dupSuffix}\n\n` +
+    `יש קבלה? שלח תמונה או *כן* / *לא* — אל תפספס החזר 📸\n` +
+    `משהו לא מדויק? *מחק* או *טעות*. אני איתך, אחי 💪`
   );
 }
 
-async function saveFullRow(phone, userSheetValue, amount, desc, category, receipt, receiptImage) {
-  const row = await appendExpenseRow(desc, amount, category, receipt, receiptImage, userSheetValue);
+async function saveFullRow(phone, userSheetValue, amount, desc, category, driveLink) {
+  const row = await appendExpenseRow(desc, amount, category, (driveLink || '').trim(), userSheetValue);
   const rowIndex = row ? row.rowNumber : null;
   console.log(`[sheets] saved row ${rowIndex} for ${phone}`);
   const us = getUserState(phone);
   us.lastRowIndex = rowIndex;
   us.lastRowTs = Date.now();
   return rowIndex;
+}
+
+async function beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick, suggestedCategory, opts = {}) {
+  const useOutboundApi = !!opts.useOutboundApi;
+  const s = getSession(phone);
+  s.state = 'AWAITING_CATEGORY_CONFIRM';
+  s.pendingCategoryPick = { ...pick, userSheetValue };
+  s.pendingSuggestedCategory = suggestedCategory;
+  s.ts = Date.now();
+  await ensureWhatsAppContentTemplates();
+  const line = `נראה לי שזה *${suggestedCategory}* — סוגרים ככה?`;
+  if (contentSidCategoryConfirm && waNorm) {
+    const ok = await sendWhatsAppContentMessage(waNorm, contentSidCategoryConfirm, { 1: line });
+    if (ok) {
+      if (!useOutboundApi && res && !res.headersSent) emptyTwiMLResponse(res);
+      return;
+    }
+  }
+  const fallback = `${line}\n\n*כן* / *לא* — או כפתורים כשמופיעים 💪`;
+  if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, fallback);
+  else if (res && !res.headersSent) sendTwiML(res, fallback);
+}
+
+async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category) {
+  const amount = pick.amount;
+  const desc = pick.desc;
+  const receiptImage = (pick.receiptImage || '').trim();
+  const dupLine = await duplicateExpenseWarningLine(waNorm, amount);
+
+  if (amount > HIGH_AMOUNT_THRESHOLD) {
+    resetSession(phone);
+    const s = getSession(phone);
+    s.state = 'AWAITING_HIGH_CONFIRM';
+    s.pendingAmount = amount;
+    s.pendingDesc = desc;
+    s.pendingCategory = category;
+    s.pendingDriveLink = receiptImage;
+    s.ts = Date.now();
+    sendTwiML(res, `סכום חזק (*${amount} ש״ח*) — *בטוח* שזה נכון? (כן / לא) 💪`);
+    return;
+  }
+
+  try {
+    const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receiptImage);
+    resetSession(phone);
+    if (receiptImage) {
+      emptyTwiMLResponse(res);
+      await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amount, desc, category) + dupLine);
+      return;
+    }
+    sendTwiML(res, confirmTextFirstMsg(amount, desc, category, dupLine));
+    const ns = getSession(phone);
+    ns.state = 'AWAITING_RECEIPT_IMAGE';
+    ns.receiptRowIndex = rowIdx;
+    ns.ts = Date.now();
+  } catch (e) {
+    console.error('[sheets] append failed:', e.message);
+    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+  }
 }
 
 const QUICK_UNDO_TTL_MS = 15 * 60 * 1000;
@@ -1841,7 +2176,7 @@ async function handleUndoLastReceiptQuickAction(res, phone, waNorm) {
     sendTwiML(res, '*לא מצאתי את השורה*\nאולי כבר נמחקה או שזה לא שלך — נסה *ניהול*.');
     return;
   }
-  const img = (getCol(row, 'ReceiptImage') || '').trim();
+  const img = sheetDriveLink(row);
   if (img) await deleteDriveFileByUrl(img);
   const ok = await deleteRowByIndexForOwner(idx, waNorm);
   us.lastRowIndex = null;
@@ -1855,85 +2190,48 @@ async function handleUndoLastReceiptQuickAction(res, phone, waNorm) {
   );
 }
 
-/** After user picks category in AWAITING_CATEGORY_CLARIFICATION (exact confirm copy per product spec). */
-async function completeExpenseAfterCategoryClarification(res, phone, userSheetValue, category, pick) {
-  const amount = pick.amount;
-  const desc = pick.desc;
-  const receipt = pick.receipt || 'No';
-  const receiptImage = pick.receiptImage || '';
-
-  if (amount > HIGH_AMOUNT_THRESHOLD) {
-    resetSession(phone);
-    const s = getSession(phone);
-    s.state = 'AWAITING_HIGH_CONFIRM';
-    s.pendingAmount = amount;
-    s.pendingDesc = desc;
-    s.pendingCategory = category;
-    s.pendingDriveLink = receiptImage || '';
-    s.ts = Date.now();
-    sendTwiML(res, `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`);
-    return;
-  }
-
-  try {
-    const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, receiptImage);
-    resetSession(phone);
-    if (receipt === 'Yes' && receiptImage) {
-      emptyTwiMLResponse(res);
-      await sendReceiptSuccessQuickReply(phone, confirmWithImageMsg(amount, desc, category));
-      return;
-    }
-    sendTwiMLMulti(res, [
-      confirmCategorySavedExact(category),
-      'יש קבלה לצרף? שלח תמונה או כן / לא 💰',
-    ]);
-    const ns = getSession(phone);
-    ns.state = 'AWAITING_RECEIPT_IMAGE';
-    ns.receiptRowIndex = rowIdx;
-    ns.ts = Date.now();
-  } catch (e) {
-    console.error('[sheets] append failed:', e.message);
-    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-  }
+/** אחרי בחירה מהרשימה — בלי אישור כפול */
+async function completeExpenseAfterCategoryClarification(res, phone, waNorm, userSheetValue, category, pick) {
+  await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category);
 }
 
 // ===================== Response Templates =====================
 
 function buildCategoriesList() {
-  const lines = ['📋 *רק הקטגוריות האלה בשיטס:*', ''];
-  for (const { keywords, category } of CATEGORY_MAP) lines.push(`• *${category}* — ${keywords.join(', ')}`);
+  const lines = ['📋 *11 הקטגוריות הרשמיות להחזר מהקיבוץ:*', ''];
+  for (const c of CANONICAL_CATEGORIES) lines.push(`• ${c}`);
   lines.push('');
-  lines.push('מילה מהרשימה = אני משייך אוטומטית. לא בטוח? אשאל אותך 🕵️‍♂️');
+  lines.push('לא בטוחים? אני אשלח רשימה אינטראקטיבית — *לא מנחשים*, רק מחזירים כסף 💪');
   return lines.join('\n');
 }
 
 function buildGreeting() {
   return (
-    'היי! אני החבר החכם שלך למעקב החזרים — *אל תהיה פראייר, אל תפספס החזרים*. 💰\n\n' +
-    '*רישום החזר:*\n' +
-    '• *סכום + תיאור* (למשל: *150 דלק*)\n' +
-    '• *תמונת קבלה* עם כיתוב — דרייב + שיטס בבת אחת\n' +
-    '• *תמונה בלבד* — אבקש ממך פרטים\n\n' +
-    '*מה עוד יש:*\n' +
-    '• *"סיכום"* / *"תראה לי"* / *"כמה הוצאתי"* — כמה כסף מחכה להחזר\n' +
-    '• *"עזרה"* — המדריך\n' +
-    '• *"מחק"* / *"טעות"* — תיקון עם אישור\n' +
-    '• *"ניהול"* — כל רישומי החזר החודש בשורות\n\n' +
-    '*הגשות:*\n' +
-    '• *"מה לא הוגש"* • *"הגשתי"*\n\n' +
-    'יאללה, לא מפספסים החזרים 🕵️‍♂️'
+    'היי אחי! אני *החבר החכם מהקיבוץ* — רק *החזרים*, רק שקלים שחוזרים אליך 💰\n\n' +
+    '*איך רושמים:*\n' +
+    '• *סכום + תיאור* (למשל: *45 אוטובוס* או *120 מונית להייפה*)\n' +
+    '• *תמונת קבלה* עם טקסט — עולה לדרייב ונכנס לשיטס\n' +
+    '• *תמונה בלבד* — אבקש ממך סכום ומה זה היה\n\n' +
+    '*פקודות שימושיות:*\n' +
+    '• *סיכום* / *תראה לי* — כמה הקיבוץ חייב להחזיר לך החודש\n' +
+    '• *עזרה* — מדריך קצר\n' +
+    '• *מחק* — תיקון טעות\n' +
+    '• *ניהול* — כל הרישומים של החודש\n\n' +
+    '• *מה לא הוגש* / *הגשתי* — מעקב אחרי סטטוס\n\n' +
+    'יאללה, לא מפספסים החזרים 💪'
   );
 }
 
 function buildHelpGuide() {
   return (
-    'היי! החבר החכם פה 🍺\n\n' +
-    '*רישום החזר:* סכום + תיאור, או תמונת קבלה (עם או בלי טקסט).\n' +
-    '*סיכום:* *"סיכום"*, *"תראה לי"* או *"כמה הוצאתי"* — רואים כמה ש"ח מחכים להחזר.\n' +
-    '*טעות:* *"מחק"* / *"טעות"* — רשימה קצרה ואישור כן/לא.\n' +
-    '*ניהול:* *"ניהול"* — כל ההחזרים שרשמת החודש.\n' +
-    '*קטגוריות / הגשה:* *"קטגוריות"*, *"מה לא הוגש"*, *"הגשתי"*.\n\n' +
-    'נתקעת? *"שלום"* ומתחילים מחדש. אל תהיה פראייר עם כסף על הרצפה 💰'
+    'אחי, הנה הכל בקצרה 💪\n\n' +
+    '*רישום:* סכום + תיאור, או קבלה (עם או בלי טקסט).\n' +
+    '*סיכום:* *סיכום* / *תראה לי* — כמה ש״ח מחכים כהחזר מהקיבוץ.\n' +
+    '*טעות:* *מחק* — בוחרים מהרשימה ומאשרים.\n' +
+    '*ניהול:* *ניהול* — עורכים שורות מהחודש.\n' +
+    '*קטגוריות:* *קטגוריות* — רואים את ה-11 הרשמיות.\n' +
+    '*הגשה:* *מה לא הוגש* / *הגשתי*.\n\n' +
+    'נתקעת? *שלום* ומתחילים מחדש. אלוף! 💰'
   );
 }
 
@@ -2013,7 +2311,7 @@ app.post('/whatsapp', async (req, res) => {
   if (session.state !== 'IDLE' && isSessionExpired(session)) {
     if (session.state === 'AWAITING_RECEIPT_IMAGE' && session.receiptRowIndex) {
       try {
-        await updateRowByIndexForOwner(session.receiptRowIndex, 'Receipt', 'No', waNorm);
+        await updateRowReceiptFlagOnly(session.receiptRowIndex, waNorm, false);
       } catch (_) {}
     }
     if (MANAGEMENT_STATES.has(session.state)) clearManagement(phone);
@@ -2022,7 +2320,10 @@ app.post('/whatsapp', async (req, res) => {
   }
 
   const ib = parseInboundInteractive(req);
-  if (session.state === 'AWAITING_CATEGORY_CLARIFICATION' && ib.categoryPayload) {
+  if (
+    (session.state === 'AWAITING_CATEGORY_CLARIFICATION' || session.state === 'AWAITING_CATEGORY_CONFIRM') &&
+    ib.categoryPayload
+  ) {
     trimmed = ib.categoryPayload;
   } else if (!trimmed && ib.categoryPayload) {
     trimmed = ib.categoryPayload;
@@ -2043,10 +2344,10 @@ app.post('/whatsapp', async (req, res) => {
 
   const summaryQuick =
     ib.btnPayload === QR_PAYLOAD_SUMMARY ||
-    (!ib.btnPayload && ib.btnText && /סיכום\s*חודשי/i.test(ib.btnText));
+    (!ib.btnPayload && ib.btnText && /סיכום\s*(?:החזרים|חודשי)/i.test(ib.btnText));
   const undoQuick =
     ib.btnPayload === QR_PAYLOAD_UNDO_LAST ||
-    (!ib.btnPayload && ib.btnText && /^מחיקה/i.test(ib.btnText.trim()));
+    (!ib.btnPayload && ib.btnText && /מחיקת\s*אחרון|^מחיקה/i.test(ib.btnText.trim()));
 
   if (summaryQuick) {
     try {
@@ -2059,6 +2360,56 @@ app.post('/whatsapp', async (req, res) => {
   }
   if (undoQuick) {
     await handleUndoLastReceiptQuickAction(res, phone, waNorm);
+    return;
+  }
+
+  if (session.state === 'IDLE' && !hasMedia && (lower === 'ביטול' || lower === 'בטל')) {
+    sendTwiML(res, 'סבבה אחי, אין בעיה — כשתרצה ממשיכים 💪');
+    return;
+  }
+
+  if (
+    session.state === 'IDLE' &&
+    !hasMedia &&
+    /^(כן|לא|yes|no|אש|סגור|עזוב|לא\s+עכשיו)\s*$/i.test(trimmed)
+  ) {
+    sendTwiML(
+      res,
+      'אחי, אין לי כרגע מה לאשר 😄 שלח *סכום + תיאור* (למשל *80 מונית*) או *סיכום* לראות כמה הקיבוץ חייב לך 💪'
+    );
+    return;
+  }
+
+  // ─── AWAITING_CATEGORY_CONFIRM (אחרי זיהוי אוטומטי) ───
+  if (session.state === 'AWAITING_CATEGORY_CONFIRM') {
+    const pick = session.pendingCategoryPick;
+    const suggested = session.pendingSuggestedCategory;
+    if (!pick || suggested == null || typeof pick.amount !== 'number' || Number.isNaN(pick.amount)) {
+      resetSession(phone);
+      sendTwiML(res, 'פג תוקף — שלח שוב *סכום + תיאור*, גבר 💪');
+      return;
+    }
+    if (ib.categoryPayload && CANONICAL_CATEGORIES.includes(ib.categoryPayload)) {
+      await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, ib.categoryPayload);
+      return;
+    }
+    if (ib.btnPayload === QR_PAYLOAD_CAT_YES) {
+      await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, suggested);
+      return;
+    }
+    if (ib.btnPayload === QR_PAYLOAD_CAT_NO) {
+      await startCategoryClarification(res, phone, pick, { waNorm });
+      return;
+    }
+    if (matchesAny(lower, INTENT_CONFIRM_YES)) {
+      await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, suggested);
+      return;
+    }
+    if (matchesAny(lower, INTENT_CONFIRM_NO)) {
+      await startCategoryClarification(res, phone, pick, { waNorm });
+      return;
+    }
+    sendTwiML(res, 'עדיין מחכה: *זו הקטגוריה?* לחץ כפתור או *כן* / *לא* 💪');
     return;
   }
 
@@ -2080,7 +2431,7 @@ app.post('/whatsapp', async (req, res) => {
       await startCategoryClarification(res, phone, pick, { waNorm });
       return;
     }
-    await completeExpenseAfterCategoryClarification(res, phone, userSheetValue, cat, pick);
+    await completeExpenseAfterCategoryClarification(res, phone, waNorm, userSheetValue, cat, pick);
     return;
   }
 
@@ -2111,10 +2462,7 @@ app.post('/whatsapp', async (req, res) => {
             const oldLink = us.managementEditRow?.receiptImage || '';
             const driveLink = await handleMediaUpload(req, receiptFileBase);
             if (driveLink && oldLink) await deleteDriveFileByUrl(oldLink);
-            await updateMultipleFieldsByIndexForOwner(rowNum, {
-              Receipt: (driveLink || oldLink) ? 'Yes' : 'No',
-              ReceiptImage: driveLink || oldLink || '',
-            }, waNorm);
+            await updateRowDriveAndLegacy(rowNum, waNorm, driveLink || oldLink || '');
             await refreshManagementEditSnapshot(phone, waNorm);
             session.state = 'MANAGEMENT_EDIT_MENU';
             touchMgmt();
@@ -2171,7 +2519,14 @@ app.post('/whatsapp', async (req, res) => {
       }
       const newDesc = sanitizeDescription(trimmed) || trimmed || '(ללא תיאור)';
       const cat = matchCategory(newDesc);
-      const updates = { Description: newDesc };
+      const docM = await getSpreadsheetDoc();
+      const sheetM = docM ? docM.sheetsByIndex[0] : null;
+      if (sheetM) await ensureHeaders(sheetM);
+      if (sheetM) await sheetM.loadHeaderRow(1);
+      const hdr = sheetM ? sheetM.headerValues || [] : [];
+      const updates = {};
+      if (hdr.includes('Notes')) updates.Notes = newDesc;
+      if (hdr.includes('Description')) updates.Description = newDesc;
       if (cat) updates.Category = cat;
       await updateMultipleFieldsByIndexForOwner(rowNum, updates, waNorm);
       await refreshManagementEditSnapshot(phone, waNorm);
@@ -2179,7 +2534,7 @@ app.post('/whatsapp', async (req, res) => {
       touchMgmt();
       const catNote = cat
         ? ''
-        : '\n(הקטגוריה בגיליון נשארה כמו שהייתה — הוסף מילה מפתח: חניה, נסיעות, אגרות…)';
+        : '\n(הקטגוריה נשארה — תוסיף מילה ברורה: מונית, אוטובוס, פנגו, גן…)';
       sendTwiML(res, `${MGMT_OK}${catNote}\n\n${editMenuPrompt(us.managementEditRow)}`);
       return;
     }
@@ -2197,10 +2552,7 @@ app.post('/whatsapp', async (req, res) => {
             const driveLink = await handleMediaUpload(req, receiptFileBase);
             if (oldLink && driveLink) await deleteDriveFileByUrl(oldLink);
             const finalImg = driveLink || oldLink;
-            await updateMultipleFieldsByIndexForOwner(rowNum, {
-              Receipt: finalImg ? 'Yes' : 'No',
-              ReceiptImage: finalImg || '',
-            }, waNorm);
+            await updateRowDriveAndLegacy(rowNum, waNorm, finalImg || '');
             await refreshManagementEditSnapshot(phone, waNorm);
             touchMgmt();
             const warn =
@@ -2295,9 +2647,9 @@ app.post('/whatsapp', async (req, res) => {
         us.managementEditRow = {
           sheetRowNumber: item.sheetRowNumber,
           date: getCol(row, 'Date'),
-          desc: getCol(row, 'Description'),
+          desc: sheetNotes(row),
           amt: parseFloat(getCol(row, 'Amount')) || 0,
-          receiptImage: getCol(row, 'ReceiptImage'),
+          receiptImage: sheetDriveLink(row),
         };
         session.state = 'MANAGEMENT_EDIT_MENU';
         touchMgmt();
@@ -2418,7 +2770,7 @@ app.post('/whatsapp', async (req, res) => {
     const rowIdx = session.receiptRowIndex;
     if (detectDeleteIntent(lower, trimmed) && !hasMedia) {
       if (rowIdx) {
-        try { await updateRowByIndexForOwner(rowIdx, 'Receipt', 'No', waNorm); } catch (_) {}
+        try { await updateRowReceiptFlagOnly(rowIdx, waNorm, false); } catch (_) {}
       }
       resetSession(phone);
       await startDeleteSelectionFlow(res, phone, waNorm);
@@ -2430,21 +2782,16 @@ app.post('/whatsapp', async (req, res) => {
         try {
           await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
           const driveLink = await handleMediaUpload(req, receiptFileBase);
-          if (rowIdx) {
-            const updates = {
-              Receipt: driveLink ? 'Yes' : 'No',
-              ReceiptImage: driveLink || '',
-            };
-            await updateMultipleFieldsByIndexForOwner(rowIdx, updates, waNorm);
-          }
+          if (rowIdx) await updateRowDriveAndLegacy(rowIdx, waNorm, driveLink || '');
           resetSession(phone);
           if (driveLink && rowIdx) {
             const row = await getRowByIndexIfOwned(rowIdx, waNorm);
             if (row) {
               const amt = parseFloat(getCol(row, 'Amount')) || 0;
-              const d = getCol(row, 'Description') || '';
+              const d = sheetNotes(row) || '';
               const cat = getCol(row, 'Category') || '';
-              await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amt, d, cat));
+              const dupLine = await duplicateExpenseWarningLine(waNorm, amt);
+              await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amt, d, cat) + dupLine);
             } else {
               await replyWhatsAppToUser(
                 waNorm,
@@ -2464,16 +2811,16 @@ app.post('/whatsapp', async (req, res) => {
       })();
       return;
     }
-    if (lower === 'כן' || lower === 'yes') {
-      if (rowIdx) await updateRowByIndexForOwner(rowIdx, 'Receipt', 'Yes', waNorm);
+    if (matchesAny(lower, INTENT_CONFIRM_YES)) {
+      if (rowIdx) await updateRowReceiptFlagOnly(rowIdx, waNorm, true);
       resetSession(phone);
-      sendTwiML(res, '✅ סבבה, קבלה מאושרת — לא מפספסים 🍺\nלביטול — *מחק*');
+      sendTwiML(res, '✅ יאללה, קבלה מאושרת — לא מפספסים 💪\nיש עוד קבלה? שלח *סכום + תיאור* 📸');
       return;
     }
-    if (lower === 'לא' || lower === 'no') {
-      if (rowIdx) await updateRowByIndexForOwner(rowIdx, 'Receipt', 'No', waNorm);
+    if (matchesAny(lower, INTENT_CONFIRM_NO)) {
+      if (rowIdx) await updateRowReceiptFlagOnly(rowIdx, waNorm, false);
       resetSession(phone);
-      sendTwiML(res, '📌 תשמור את הקבלה — זה הכסף שלך, לא של מישהו אחר 💰\nלביטול — *מחק*');
+      sendTwiML(res, '📌 תשמור את הקבלה אצלך — זה הכסף שלך מהקיבוץ 💰\nיש עוד משהו? שלח כשמוכן 💪');
       return;
     }
     sendTwiML(
@@ -2507,42 +2854,17 @@ app.post('/whatsapp', async (req, res) => {
         return;
       }
       resetSession(phone);
-
-      if (amount > HIGH_AMOUNT_THRESHOLD) {
-        const s = getSession(phone);
-        s.state = 'AWAITING_HIGH_CONFIRM';
-        s.pendingAmount = amount;
-        s.pendingDesc = desc;
-        s.pendingCategory = category;
-        s.pendingDriveLink = pendingDriveLink;
-        s.ts = Date.now();
-        sendTwiML(res, `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`);
-        return;
-      }
-
-      try {
-        const receipt = pendingDriveLink ? 'Yes' : 'No';
-        const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, pendingDriveLink || '');
-        if (pendingDriveLink) {
-          emptyTwiMLResponse(res);
-          await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amount, desc, category));
-        } else {
-          const ns = getSession(phone);
-          ns.state = 'AWAITING_RECEIPT_IMAGE';
-          ns.receiptRowIndex = rowIdx;
-          ns.ts = Date.now();
-          sendTwiML(
-            res,
-            `קלטתי 🙂 *${amount} ₪* על *${desc}*, תחת ${category}.\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n\nהרישום בשיטס — שלח *תמונה שוב* או *כן* / *לא*.`
-          );
-        }
-      } catch (e) {
-        console.error('[sheets] append failed:', e.message);
-        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-      }
+      const pick = {
+        amount,
+        desc,
+        userSheetValue,
+        receipt: pendingDriveLink ? 'Yes' : 'No',
+        receiptImage: pendingDriveLink || '',
+      };
+      await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick, category, {});
       return;
     }
-    sendTwiML(res, 'לא קלטתי סכום. *סכום + תיאור* (למשל: *50 חניה*) — אל תפספס החזר 🍺');
+    sendTwiML(res, 'לא קלטתי סכום. *סכום + תיאור* (למשל: *50 אוטובוס*) — אל תפספס החזר 💪');
     return;
   }
 
@@ -2574,40 +2896,17 @@ app.post('/whatsapp', async (req, res) => {
             return;
           }
 
-          if (amount > HIGH_AMOUNT_THRESHOLD) {
-            const s = getSession(phone);
-            s.state = 'AWAITING_HIGH_CONFIRM';
-            s.pendingAmount = amount;
-            s.pendingDesc = desc;
-            s.pendingCategory = category;
-            s.pendingDriveLink = driveLink || '';
-            s.ts = Date.now();
-            await replyWhatsAppToUser(
-              waNorm,
-              `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`
-            );
-            return;
-          }
-
-          try {
-            const receipt = driveLink ? 'Yes' : 'No';
-            const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receipt, driveLink || '');
-            if (driveLink) {
-              await sendReceiptSuccessQuickReply(waNorm, confirmWithImageMsg(amount, desc, category));
-            } else {
-              const ns = getSession(phone);
-              ns.state = 'AWAITING_RECEIPT_IMAGE';
-              ns.receiptRowIndex = rowIdx;
-              ns.ts = Date.now();
-              await replyWhatsAppToUser(
-                waNorm,
-                `קלטתי 🙂 *${amount} ₪* על *${desc}*, תחת ${category}.\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n\nהרישום בשיטס — שלח *תמונה שוב* או *כן* / *לא*. לביטול — *מחק*`
-              );
-            }
-          } catch (se) {
-            console.error('[sheets] append failed:', se.message);
-            await replyWhatsAppToUser(waNorm, 'שגיאה בשמירה, נסה שוב');
-          }
+          resetSession(phone);
+          const pickA = {
+            amount,
+            desc,
+            userSheetValue,
+            receipt: driveLink ? 'Yes' : 'No',
+            receiptImage: driveLink || '',
+          };
+          await beginCategoryConfirmFlow(null, waNorm, phone, userSheetValue, pickA, category, {
+            useOutboundApi: true,
+          });
         } catch (e) {
           console.error('[whatsapp] scenario A:', e.message);
           await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
@@ -2629,7 +2928,7 @@ app.post('/whatsapp', async (req, res) => {
         if (driveLink) {
           await replyWhatsAppToUser(
             waNorm,
-            'קלטתי את הקבלה! 📸\nעל איזה החזר מדובר וכמה זה? (למשל: *50 חניה*) 🍺'
+            'קלטתי את הקבלה! 📸\nעל איזה החזר מדובר וכמה זה? (למשל: *50 פנגו* / *120 מונית*) 💪'
           );
         } else {
           await replyWhatsAppToUser(
@@ -2734,7 +3033,7 @@ app.post('/whatsapp', async (req, res) => {
 
   // ─── POLITENESS ───
   if (matchesAny(lower, INTENT_POLITENESS)) {
-    sendTwiML(res, 'בשמחה! רוצה *סיכום* או *תראה לי* — נראה כמה ש"ח מחכים להחזר? 💰');
+    sendTwiML(res, 'בשמחה גבר! 💪\nיש עוד קבלה או החזר לרשום? שלח *סכום + תיאור* או תמונה — ממשיכים לגבות מהקיבוץ 💰');
     return;
   }
 
@@ -2769,28 +3068,14 @@ app.post('/whatsapp', async (req, res) => {
         return;
       }
       resetSession(phone);
-      if (parsed.amount > HIGH_AMOUNT_THRESHOLD) {
-        const ns = getSession(phone);
-        ns.state = 'AWAITING_HIGH_CONFIRM';
-        ns.pendingAmount = parsed.amount;
-        ns.pendingDesc = parsed.description;
-        ns.pendingCategory = category;
-        ns.pendingDriveLink = '';
-        ns.ts = Date.now();
-        sendTwiML(res, `זה סכום גבוה מהרגיל (*${parsed.amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`);
-        return;
-      }
-      try {
-        const rowIdx = await saveFullRow(phone, userSheetValue, parsed.amount, parsed.description, category, 'No', '');
-        const ns = getSession(phone);
-        ns.state = 'AWAITING_RECEIPT_IMAGE';
-        ns.receiptRowIndex = rowIdx;
-        ns.ts = Date.now();
-        sendTwiML(res, confirmTextFirstMsg(parsed.amount, parsed.description, category));
-      } catch (e) {
-        console.error('[sheets] append failed:', e.message);
-        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-      }
+      const pickD1 = {
+        amount: parsed.amount,
+        desc: parsed.description,
+        userSheetValue,
+        receipt: 'No',
+        receiptImage: '',
+      };
+      await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickD1, category, {});
       return;
     }
 
@@ -2812,21 +3097,23 @@ app.post('/whatsapp', async (req, res) => {
       return;
     }
     resetSession(phone);
-    try {
-      const rowIdx = await saveFullRow(phone, userSheetValue, pendingAmount, desc, category, 'No', '');
-      const ns = getSession(phone);
-      ns.state = 'AWAITING_RECEIPT_IMAGE';
-      ns.receiptRowIndex = rowIdx;
-      ns.ts = Date.now();
-      sendTwiML(res, confirmTextFirstMsg(pendingAmount, desc, category));
-    } catch (e) {
-      console.error('[sheets] append failed:', e.message);
-      sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-    }
+    const pickD2 = {
+      amount: pendingAmount,
+      desc,
+      userSheetValue,
+      receipt: 'No',
+      receiptImage: '',
+    };
+    await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickD2, category, {});
     return;
   }
 
   if (getSession(phone).state === 'AWAITING_AMOUNT') {
+    if (CURRENCY_RE.test(trimmed)) {
+      resetSession(phone);
+      sendTwiML(res, '⚠️ רושמים ב-₪ בלבד — בלי סימני מטבע זר. שלח שוב, גבר 💪');
+      return;
+    }
     const s = getSession(phone);
     const parsed = parseExpenseMessage(trimmed);
     if (parsed.amount) {
@@ -2848,17 +3135,14 @@ app.post('/whatsapp', async (req, res) => {
         return;
       }
       resetSession(phone);
-      try {
-        const rowIdx = await saveFullRow(phone, userSheetValue, parsed.amount, pendingDesc, resolved, 'No', '');
-        const ns = getSession(phone);
-        ns.state = 'AWAITING_RECEIPT_IMAGE';
-        ns.receiptRowIndex = rowIdx;
-        ns.ts = Date.now();
-        sendTwiML(res, confirmTextFirstMsg(parsed.amount, pendingDesc, resolved));
-      } catch (e) {
-        console.error('[sheets] append failed:', e.message);
-        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-      }
+      const pickAm = {
+        amount: parsed.amount,
+        desc: pendingDesc,
+        userSheetValue,
+        receipt: 'No',
+        receiptImage: '',
+      };
+      await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickAm, resolved, {});
       return;
     }
     resetSession(phone);
@@ -2878,17 +3162,27 @@ app.post('/whatsapp', async (req, res) => {
       resetSession(phone);
       try {
         const hasImage = !!pendingDriveLink;
-        const receipt = hasImage ? 'Yes' : 'No';
-        const rowIdx = await saveFullRow(phone, userSheetValue, pendingAmount, pendingDesc, pendingCategory, receipt, pendingDriveLink || '');
+        const dupLine = await duplicateExpenseWarningLine(waNorm, pendingAmount);
+        const rowIdx = await saveFullRow(
+          phone,
+          userSheetValue,
+          pendingAmount,
+          pendingDesc,
+          pendingCategory,
+          pendingDriveLink || ''
+        );
         if (hasImage) {
           emptyTwiMLResponse(res);
-          await sendReceiptSuccessQuickReply(phone, confirmWithImageMsg(pendingAmount, pendingDesc, pendingCategory));
+          await sendReceiptSuccessQuickReply(
+            phone,
+            confirmWithImageMsg(pendingAmount, pendingDesc, pendingCategory) + dupLine
+          );
         } else {
           const ns = getSession(phone);
           ns.state = 'AWAITING_RECEIPT_IMAGE';
           ns.receiptRowIndex = rowIdx;
           ns.ts = Date.now();
-          sendTwiML(res, confirmTextFirstMsg(pendingAmount, pendingDesc, pendingCategory));
+          sendTwiML(res, confirmTextFirstMsg(pendingAmount, pendingDesc, pendingCategory, dupLine));
         }
       } catch (e) {
         console.error('[sheets] append failed:', e.message);
@@ -2927,7 +3221,13 @@ app.post('/whatsapp', async (req, res) => {
 
   // ─── CURRENCY ALERT ───
   if (CURRENCY_RE.test(trimmed)) {
-    sendTwiML(res, '⚠️ רושמים החזרים ב-₪ בלבד.\nאם זה בש"ח — שלח בלי סימן מטבע זר, שלא יבלבל 🕵️‍♂️');
+    sendTwiML(res, '⚠️ רושמים החזרים ב-₪ בלבד.\nאם זה בש"ח — שלח בלי סימן מטבע זר, שלא יבלבל 💪');
+    return;
+  }
+
+  const bridgeMsg = tryBridgingSmallTalk(lower, trimmed);
+  if (bridgeMsg && session.state === 'IDLE' && !hasMedia) {
+    sendTwiML(res, bridgeMsg);
     return;
   }
 
@@ -2951,28 +3251,15 @@ app.post('/whatsapp', async (req, res) => {
       );
       return;
     }
-    if (amount > HIGH_AMOUNT_THRESHOLD) {
-      const s = getSession(phone);
-      s.state = 'AWAITING_HIGH_CONFIRM';
-      s.pendingAmount = amount;
-      s.pendingDesc = description;
-      s.pendingCategory = category;
-      s.pendingDriveLink = '';
-      s.ts = Date.now();
-      sendTwiML(res, `זה סכום גבוה מהרגיל (*${amount} ₪*), אתה בטוח שזה נכון? (כן / לא)`);
-      return;
-    }
-    try {
-      const rowIdx = await saveFullRow(phone, userSheetValue, amount, description, category, 'No', '');
-      const s = getSession(phone);
-      s.state = 'AWAITING_RECEIPT_IMAGE';
-      s.receiptRowIndex = rowIdx;
-      s.ts = Date.now();
-      sendTwiML(res, confirmTextFirstMsg(amount, description, category));
-    } catch (e) {
-      console.error('[sheets] append failed:', e.message);
-      sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
-    }
+    resetSession(phone);
+    const pickC = {
+      amount,
+      desc: description,
+      userSheetValue,
+      receipt: 'No',
+      receiptImage: '',
+    };
+    await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickC, category, {});
     return;
   }
 
@@ -2981,7 +3268,7 @@ app.post('/whatsapp', async (req, res) => {
     s.state = 'AWAITING_DESCRIPTION';
     s.pendingAmount = amount;
     s.ts = Date.now();
-    sendTwiML(res, `קיבלתי *${amount} ₪*. על איזה החזר? (למשל: חניה) 🍺`);
+    sendTwiML(res, `קיבלתי *${amount} ₪*. על איזה החזר? (למשל: *פנגו* / *מונית*) 💪`);
     return;
   }
 
@@ -2997,7 +3284,7 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  sendTwiML(res, 'לא הבנתי 🤔\n*סכום + תיאור* (למשל: *150 דלק*) — או *תמונת קבלה* 📸\n*"שלום"* לעזרה. אל תהיה פראייר עם כסף על הרצפה 💰');
+  sendTwiML(res, 'לא הבנתי 🤔\n*סכום + תיאור* (למשל: *45 אוטובוס* / *80 מונית*) — או *תמונת קבלה* 📸\n*"שלום"* לעזרה. אחי, לא מפספסים החזרים 💪');
   } catch (err) {
     console.error('[whatsapp] unhandled error:', err && err.stack ? err.stack : err);
     if (!res.headersSent) {
@@ -3038,7 +3325,7 @@ app.post('/webhook', async (req, res) => {
       try {
         await saveToSheet(desc, amount, category, ctx.userSheetValue);
       } catch (e) { console.error('[webhook] sheets:', e.message); }
-      sendTwiML(res, `קלטתי 🙂 *${amount} ₪* על *${desc}* — תחת ${category}. עוד כסף ברשימת המגיע לי 💰`);
+      sendTwiML(res, `יאללה קלטתי 🙂 *${amount} ₪* על *${desc}* — תחת ${category}. עוד כסף שחוזר מהקיבוץ 💪`);
     } else {
       sendTwiML(res, `קיבלתי ממך: ${message}`);
     }
@@ -3105,11 +3392,11 @@ function runLocalUnitChecks() {
   t('parse sanitize', b.amount === 50 && b.description === 'דלק');
   const c = parseExpenseMessage('בסך 45 חניה');
   t('parse בסך + החניה', c.amount === 45 && (c.description.includes('חניה') || c.description === 'חניה'));
-  t('category "בחנייה"', matchCategory('בחנייה') === 'חניה');
-  t('category "למונית"', matchCategory('למונית') === 'נסיעות');
-  t('category דלק', matchCategory('150 דלק') === 'נסיעות');
-  t('resolve "פנגו"', resolveCategoryFromReply('פנגו') === 'חניה');
-  t('resolve list id CAT_PARKING', resolveCategoryFromReply('CAT_PARKING') === 'חניה');
+  t('category פנגו → חנייה', matchCategory('בחנייה') === CAT.parking);
+  t('category מונית', matchCategory('למונית') === CAT.taxi);
+  t('category אוטובוס', matchCategory('45 אוטובוס') === CAT.transit);
+  t('resolve פנגו', resolveCategoryFromReply('פנגו') === CAT.parking);
+  t('resolve list id CAT_K_TAXI', resolveCategoryFromReply('CAT_K_TAXI') === CAT.taxi);
   t('intent "הסיכום"', matchesAny('הסיכום', INTENT_SUMMARY));
   t('detect summary "תראה לי"', detectSummaryIntent('תראה לי מה יש', 'תראה לי מה יש'));
   t('detect summary סטטיסטיקה', detectSummaryIntent('סטטיסטיקה', 'סטטיסטיקה'));
@@ -3123,15 +3410,15 @@ function runLocalUnitChecks() {
   t('MoM total insight up', formatMoMTotalInsight(120, 100, 'ינואר').includes('20%'));
   t('QuickChart doughnut JS config', (() => {
     const js = buildMonthlySummaryDoughnutChartJs([
-      ['חניה', 40],
-      ['נסיעות', 60],
+      [CAT.parking, 40],
+      [CAT.taxi, 60],
     ]);
     return (
       js.includes('doughnut') &&
       js.includes('datalabels') &&
       js.includes('פילוח') &&
       js.includes('Varela Round') &&
-      js.includes('#FF6384')
+      js.includes('#FFB5C2')
     );
   })());
 }
@@ -3157,19 +3444,23 @@ async function runHttpSmokeTests(port) {
 
   const cases = [
     { name: 'greeting', fields: { Body: 'שלום', From: F } },
-    { name: '150 דלק → save', fields: { Body: '150 דלק', From: F } },
-    { name: 'כן → receipt', fields: { Body: 'כן', From: F } },
-    { name: '80 סלולר → save', fields: { Body: '80 סלולר', From: F } },
-    { name: 'לא → no receipt', fields: { Body: 'לא', From: F } },
+    { name: '150 מונית → אישור קטגוריה', fields: { Body: '150 מונית', From: F } },
+    { name: 'כן → קבלה', fields: { Body: 'כן', From: F } },
+    { name: 'לא → בלי קבלה', fields: { Body: 'לא', From: F } },
+    { name: '80 סלולר → אישור קטגוריה', fields: { Body: '80 סלולר', From: F } },
+    { name: 'אש → המשך', fields: { Body: 'אש', From: F } },
     { name: 'מחק → delete flow', fields: { Body: 'מחק', From: F } },
     { name: '42 → ask desc', fields: { Body: '42', From: F } },
-    { name: 'חניה → complete', fields: { Body: 'חניה', From: F } },
-    { name: 'כן → receipt', fields: { Body: 'כן', From: F } },
+    { name: 'פנגו → אישור קטגוריה', fields: { Body: 'פנגו', From: F } },
+    { name: 'סגור → קבלה', fields: { Body: 'סגור', From: F } },
     { name: 'img-only → ask details', fields: { Body: '', From: F, NumMedia: '1', MediaUrl0: 'https://example.com/img.jpg', MediaContentType0: 'image/jpeg' } },
-    { name: '55 מונית → complete img', fields: { Body: '55 מונית', From: F } },
-    { name: '3000 דלק → high', fields: { Body: '3000 דלק', From: F } },
-    { name: 'כן → confirm', fields: { Body: 'כן', From: F } },
-    { name: 'לא → no receipt', fields: { Body: 'לא', From: F } },
+    { name: '55 מונית → אישור', fields: { Body: '55 מונית', From: F } },
+    { name: 'כן אישור קטגוריה 55', fields: { Body: 'כן', From: F } },
+    { name: 'לא בלי קבלה 55', fields: { Body: 'לא', From: F } },
+    { name: '3000 מונית → אישור קטגוריה', fields: { Body: '3000 מונית', From: F } },
+    { name: 'כן קטגוריה גבוהה', fields: { Body: 'כן', From: F } },
+    { name: 'כן סכום גבוה', fields: { Body: 'כן', From: F } },
+    { name: 'לא קבלה אחרי גבוה', fields: { Body: 'לא', From: F } },
     { name: 'מה לא הוגש', fields: { Body: 'מה לא הוגש', From: F } },
     { name: 'הגשתי', fields: { Body: 'הגשתי', From: F } },
     { name: 'סיכום', fields: { Body: 'סיכום', From: F } },
