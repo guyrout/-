@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const { Readable } = require('stream');
 const express = require('express');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
@@ -44,6 +45,8 @@ const GOOGLE_SHEET_ID = (
   process.env.GOOGLE_SHEET_ID || '1xd9BILngzkLX57ja4On73TIehGJIPkCmuS9aEjAhc48'
 ).trim();
 const GOOGLE_DRIVE_FOLDER_ID = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+/** Public base URL (no trailing slash) so Twilio can fetch one-time chart PNGs from GET /__media/chart/:token */
+const PUBLIC_WEBHOOK_BASE = (process.env.PUBLIC_WEBHOOK_BASE || '').trim().replace(/\/$/, '');
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
@@ -1247,16 +1250,6 @@ const HEB_MONTHS = [
   'יולי', 'אוגוסט', 'ספטמבר', 'אוקטובר', 'נובמבר', 'דצמבר',
 ];
 
-/** QuickChart pie slice colors (canonical sheet categories; unknown → slate) */
-const CATEGORY_CHART_COLORS = {
-  חניה: '#2563EB',
-  נסיעות: '#EAB308',
-  אגרות: '#EA580C',
-  תקשורת: '#22C55E',
-  'ציוד משרדי': '#A855F7',
-  בריאות: '#16A34A',
-};
-
 function formatShekelDisplay(n) {
   const x = Number(n);
   if (Number.isNaN(x)) return '0';
@@ -1328,71 +1321,103 @@ function savvyDeepInsightTopCategory(topCategory, topAmount, grandTotal) {
 
 const QUICKCHART_BASE = 'https://quickchart.io/chart';
 
+/** Pastel palette (exact order for slice assignment by sort index) */
+const MONTHLY_DOUGHNUT_PASTELS = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF'];
+
+const SUMMARY_CHART_WHATSAPP_CAPTION = 'הנה הגרף שלך!  תראה איפה הכסף שלך נמצא.';
+
+/** One-time PNG blobs for Twilio MediaUrl when PUBLIC_WEBHOOK_BASE is set */
+const chartPngOneShot = new Map();
+
 /**
- * Pie chart PNG URL via QuickChart. Hebrew labels: UTF-8 JSON → base64 + encoding=base64
- * (avoids broken labels from raw URL-encoded Unicode in some clients).
+ * QuickChart Chart.js v2 config as JavaScript source (not JSON) so datalabels formatter works.
+ * Design: doughnut, bottom legend (Varela Round + Hebrew fallback), title, white % inside slices.
  */
-function buildQuickChartPieImageUrl(categoryTotalsMap) {
+function buildMonthlySummaryDoughnutChartJs(entries) {
+  const labelsJson = entries.map(([c]) => JSON.stringify(c)).join(',');
+  const dataStr = entries.map(([, a]) => a).join(',');
+  const bgStr = entries
+    .map((_, i) => JSON.stringify(MONTHLY_DOUGHNUT_PASTELS[i % MONTHLY_DOUGHNUT_PASTELS.length]))
+    .join(',');
+  const titleStr = JSON.stringify('פילוח ההחזרים חודשי 📊');
+  return `{type:'doughnut',data:{labels:[${labelsJson}],datasets:[{data:[${dataStr}],backgroundColor:[${bgStr}],borderWidth:2,borderColor:'#ffffff'}]},options:{cutoutPercentage:62,legend:{position:'bottom',rtl:true,labels:{fontFamily:'Varela Round, Noto Sans Hebrew',fontColor:'#1e293b',fontSize:13,padding:16,usePointStyle:true,boxWidth:10}},title:{display:true,text:${titleStr},fontFamily:'Varela Round, Noto Sans Hebrew',fontSize:18,fontColor:'#0f172a',fontStyle:'bold',padding:20},plugins:{datalabels:{display:true,color:'#ffffff',font:{weight:'bold',size:16,family:'Varela Round, Arial'},textStrokeColor:'rgba(15,23,42,0.4)',textStrokeWidth:3,formatter:(value,ctx)=>{var arr=ctx.dataset.data,s=0,i;for(i=0;i<arr.length;i++)s+=arr[i];if(!s)return'';var p=Math.round((value/s)*100);return p<4?'':(p+'%');}}}}}`;
+}
+
+async function fetchQuickChartPngBuffer(chartJsString) {
+  const r = await axios.post(
+    QUICKCHART_BASE,
+    {
+      chart: chartJsString,
+      width: 720,
+      height: 720,
+      backgroundColor: 'white',
+      devicePixelRatio: 1,
+      format: 'png',
+      version: '2.9.4',
+    },
+    {
+      responseType: 'arraybuffer',
+      timeout: 35000,
+      headers: { 'Content-Type': 'application/json' },
+      validateStatus: () => true,
+    }
+  );
+  if (r.status !== 200 || !r.data) {
+    throw new Error(`QuickChart POST ${r.status}`);
+  }
+  const buf = Buffer.from(r.data);
+  if (buf.length < 8 || buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) {
+    throw new Error('QuickChart response is not PNG');
+  }
+  return buf;
+}
+
+function registerChartPngOneShotUrl(buffer) {
+  if (!PUBLIC_WEBHOOK_BASE || !buffer?.length) return null;
+  const token = crypto.randomBytes(20).toString('hex');
+  chartPngOneShot.set(token, { buffer, created: Date.now() });
+  setTimeout(() => chartPngOneShot.delete(token), 120000);
+  return `${PUBLIC_WEBHOOK_BASE}/__media/chart/${token}`;
+}
+
+async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap) {
   const entries = [...categoryTotalsMap.entries()]
     .filter(([, amt]) => amt > 0)
     .sort((a, b) => b[1] - a[1]);
-  if (entries.length === 0) return null;
+  if (entries.length === 0) return;
 
-  const labels = entries.map(([cat, amt]) => `${cat} (${formatShekelDisplay(amt)} ש״ח)`);
-  const data = entries.map(([, amt]) => amt);
-  const backgroundColor = entries.map(([cat]) => CATEGORY_CHART_COLORS[cat] || '#94A3B8');
+  const chartJs = buildMonthlySummaryDoughnutChartJs(entries);
+  const caption = SUMMARY_CHART_WHATSAPP_CAPTION;
 
-  const chartConfig = {
-    type: 'pie',
-    data: {
-      labels,
-      datasets: [
-        {
-          data,
-          backgroundColor,
-          borderWidth: 2,
-          borderColor: '#ffffff',
-        },
-      ],
-    },
-    options: {
-      plugins: {
-        legend: {
-          position: 'bottom',
-          rtl: true,
-          labels: {
-            font: { size: 12, family: 'Noto Sans Hebrew' },
-            color: '#0f172a',
-            padding: 14,
-          },
-        },
-        title: {
-          display: true,
-          text: 'התפלגות החזרים לפי קטגוריה',
-          font: { size: 15, family: 'Noto Sans Hebrew' },
-          color: '#020617',
-          padding: { bottom: 8 },
-        },
-      },
-    },
-  };
+  try {
+    const png = await fetchQuickChartPngBuffer(chartJs);
+    const hosted = registerChartPngOneShotUrl(png);
+    if (hosted) {
+      const ok = await replyWhatsAppWithMedia(waNorm, [hosted], caption);
+      if (ok) return;
+    }
+  } catch (e) {
+    console.warn('[quickchart] POST chart failed:', e.message);
+  }
 
-  const jsonUtf8 = JSON.stringify(chartConfig);
-  const chartB64 = Buffer.from(jsonUtf8, 'utf8').toString('base64');
-  const qs = new URLSearchParams();
-  qs.set('encoding', 'base64');
-  qs.set('chart', chartB64);
-  qs.set('w', '640');
-  qs.set('h', '640');
-  qs.set('devicePixelRatio', '1');
-  qs.set('version', '4');
-  qs.set('format', 'png');
-  qs.set('backgroundColor', 'white');
-  return `${QUICKCHART_BASE}?${qs.toString()}`;
+  try {
+    const getUrl = `${QUICKCHART_BASE}?c=${encodeURIComponent(chartJs)}&w=720&h=720&bkg=white&v=2.9.4&devicePixelRatio=1`;
+    if (getUrl.length < 7900) {
+      const ok = await replyWhatsAppWithMedia(waNorm, [getUrl], caption);
+      if (ok) return;
+    }
+  } catch (e2) {
+    console.warn('[quickchart] GET chart URL failed:', e2.message);
+  }
+
+  await replyWhatsAppToUser(
+    waNorm,
+    'שמע, הגרף לא עלה הפעם — המספרים בהודעה הקודמת בכל זאת מדויקים. אם יש לך כתובת ציבורית לשרת, הגדר *PUBLIC_WEBHOOK_BASE* לשליחת תמונה יציבה 🕵️‍♂️'
+  );
 }
 
 /**
- * First line: required headline + MoM + insight. Second message: chart URL (caller sends via Twilio media).
+ * First line: required headline + MoM + insight. Second message: chart (downloaded PNG path or QuickChart URL).
  */
 async function buildVisualSummaryPackage(ownerWaNorm) {
   const agg = await fetchTwoMonthCategoryAggregates(ownerWaNorm);
@@ -1421,8 +1446,7 @@ async function buildVisualSummaryPackage(ownerWaNorm) {
     .filter(Boolean)
     .join('\n\n');
 
-  const chartUrl = buildQuickChartPieImageUrl(agg.curByCategory);
-  return { firstMessage, chartUrl };
+  return { firstMessage, categoryTotals: agg.curByCategory };
 }
 
 async function sendVisualMonthlySummary(res, waNorm) {
@@ -1432,19 +1456,7 @@ async function sendVisualMonthlySummary(res, waNorm) {
     return;
   }
   sendTwiML(res, pkg.firstMessage);
-  if (pkg.chartUrl) {
-    const ok = await replyWhatsAppWithMedia(
-      waNorm,
-      [pkg.chartUrl],
-      '📊 *העוגה שלך לפי קטגוריות* — עברית מסודרת, כמו שצריך. החבר החכם 🍰'
-    );
-    if (!ok) {
-      await replyWhatsAppToUser(
-        waNorm,
-        'שמע, הגרף לא יצא בנסיעה (בעיה בשליחת התמונה) — אבל המספרים בהודעה הקודמת מדויקים. נסה *סיכום* שוב מאוחר יותר 🕵️‍♂️'
-      );
-    }
-  }
+  await sendMonthlySummaryChartToWhatsApp(waNorm, pkg.categoryTotals);
 }
 
 const SUMMARY_FOOTERS = [
@@ -1943,6 +1955,10 @@ function logConfigOnce() {
       ? 'none (all senders allowed — set ALLOWED_USERS / ALLOWED_WHATSAPP_NUMBERS for production)'
       : `${MERGED_ALLOWED_USERS.length} configured`
   );
+  console.log(
+    '[config] PUBLIC_WEBHOOK_BASE:',
+    PUBLIC_WEBHOOK_BASE || '(not set — monthly chart may use direct QuickChart URL only)'
+  );
 }
 logConfigOnce();
 
@@ -1952,6 +1968,18 @@ const TWILIO_FROM_TEST = 'whatsapp:+15551234567';
 
 app.get('/health', (_req, res) => {
   res.status(200).type('text/plain').send('ok');
+});
+
+/** Short-lived PNG for Twilio WhatsApp media (requires PUBLIC_WEBHOOK_BASE). */
+app.get('/__media/chart/:token', (req, res) => {
+  const rec = chartPngOneShot.get(req.params.token);
+  if (!rec?.buffer) {
+    res.status(404).type('text/plain').send('Not found');
+    return;
+  }
+  res.type('image/png');
+  res.set('Cache-Control', 'no-store');
+  res.send(rec.buffer);
 });
 
 app.post('/whatsapp', async (req, res) => {
@@ -3093,12 +3121,18 @@ function runLocalUnitChecks() {
   t('intent "ניהול"', matchesAny('ניהול', INTENT_MANAGEMENT));
   t('intent "מחק שורה"', matchesAny('מחק שורה', INTENT_MANAGEMENT));
   t('MoM total insight up', formatMoMTotalInsight(120, 100, 'ינואר').includes('20%'));
-  t('QuickChart base64 URL', (() => {
-    const u = buildQuickChartPieImageUrl(new Map([
+  t('QuickChart doughnut JS config', (() => {
+    const js = buildMonthlySummaryDoughnutChartJs([
       ['חניה', 40],
       ['נסיעות', 60],
-    ]));
-    return u && u.includes('encoding=base64') && u.includes('quickchart.io');
+    ]);
+    return (
+      js.includes('doughnut') &&
+      js.includes('datalabels') &&
+      js.includes('פילוח') &&
+      js.includes('Varela Round') &&
+      js.includes('#FF6384')
+    );
   })());
 }
 
