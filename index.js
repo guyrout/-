@@ -16,12 +16,15 @@ const axios = require('axios');
 const cron = require('node-cron');
 const twilio = require('twilio');
 const MessagingResponse = twilio.twiml.MessagingResponse;
-const kibbutzData = require('./kibbutzData');
 const {
+  findKibbutzMatches,
   findKibbutzEntryForText,
   extractSubmissionContacts,
-  findBreachedPolicyCap,
   buildSmartLogReply,
+  serializeDisambigEntry,
+  capNoteFromEntry,
+  estimatedRefund,
+  potentialRefundForAmountAndTopic,
 } = require('./kibbutzSmart');
 
 const app = express();
@@ -41,18 +44,28 @@ function formatKibbutzKnowledgeAnswer(answer) {
   return String(answer || '').replace(/\*\*/g, '*');
 }
 
-/** התאמה ראשונה לפי מילת מפתח (תת-מחרוזת ב-lower). */
-function matchKibbutzKnowledge(lower) {
-  for (const entry of kibbutzData) {
-    const keywords = entry.keywords || [];
-    for (const kw of keywords) {
-      const needle = String(kw).toLowerCase();
-      if (needle && lower.includes(needle)) {
-        return formatKibbutzKnowledgeAnswer(entry.answer);
+/** בירור: מספר שורה או חלק משם נושא */
+function resolveKibbutzDisambigIndex(trimmed, matches) {
+  const t = String(trimmed || '').trim();
+  if (/^\d+$/.test(t)) {
+    const n = parseInt(t, 10);
+    if (n >= 1 && n <= matches.length) return n - 1;
+    return -1;
+  }
+  const lower = t.toLowerCase();
+  let best = -1;
+  let bestLen = 0;
+  matches.forEach((m, i) => {
+    const top = String(m.topic || '').toLowerCase();
+    if (!top) return;
+    if (lower.includes(top) || top.includes(lower)) {
+      if (top.length > bestLen) {
+        bestLen = top.length;
+        best = i;
       }
     }
-  }
-  return null;
+  });
+  return best;
 }
 
 function savvySummaryTotalLine(total) {
@@ -1648,8 +1661,15 @@ function savvyDeepInsightTopContact(topLabel, topAmount, grandTotal) {
   return `רוב הסכום מרוכז אצל *${topLabel}* — *${share}%* מהחודש.`;
 }
 
-/** סיכום חודשי מקובץ לפי איש קשר להגשה (SubmissionContact) */
-function formatMonthlySummaryBySubmissionContact(monthName, rows, totalShekels, footnoteLines = []) {
+/** סיכום חודשי מקובץ לפי איש קשר + הוצאות בפועל מול החזרים משוערים (לפי תקרות ב־kibbutzData) */
+function formatMonthlySummaryBySubmissionContact(monthName, rows, footnoteLines = []) {
+  let actualGrand = 0;
+  let potentialGrand = 0;
+  for (const r of rows) {
+    actualGrand += r.amt;
+    potentialGrand += potentialRefundForAmountAndTopic(r.amt, (r.topic || r.cat || '').trim());
+  }
+
   const byContact = new Map();
   for (const r of rows) {
     const key = (r.submissionContact || '').trim() || 'ללא איש קשר להגשה';
@@ -1681,7 +1701,8 @@ function formatMonthlySummaryBySubmissionContact(monthName, rows, totalShekels, 
   }
   body.push(UI_DIV);
   body.push('');
-  body.push(`*סה״כ החזרים צפויים לחודש זה:* *${formatShekelDisplay(totalShekels)}* ש"ח`);
+  body.push(`*סה״כ הוצאות שנרשמו:* *${formatShekelDisplay(actualGrand)}* ש"ח`);
+  body.push(`*סה״כ החזרים משוערים (לפי תקרות):* *${formatShekelDisplay(potentialGrand)}* ש"ח`);
   for (const line of footnoteLines) {
     if (line) {
       body.push('');
@@ -1844,7 +1865,7 @@ async function buildVisualSummaryPackage(ownerWaNorm) {
 
   if (agg.curRows.length === 0 || curTotal <= 0) {
     return {
-      firstMessage: formatMonthlySummaryBySubmissionContact(monthName, [], 0, [comparison]),
+      firstMessage: formatMonthlySummaryBySubmissionContact(monthName, [], [comparison]),
       chartUrl: null,
       categoryTotals: contactTotalsMap,
       chartCaption: summaryChartCaptionContacts(formatShekelDisplay(0)),
@@ -1855,7 +1876,7 @@ async function buildVisualSummaryPackage(ownerWaNorm) {
   const [topContact, topCAmt] = sortedC[0] || ['', 0];
   const deep = savvyDeepInsightTopContact(topContact, topCAmt, curTotal);
 
-  const firstMessage = formatMonthlySummaryBySubmissionContact(monthName, agg.curRows, curTotal, [
+  const firstMessage = formatMonthlySummaryBySubmissionContact(monthName, agg.curRows, [
     comparison,
     deep,
   ]);
@@ -1918,7 +1939,7 @@ async function buildMonthlySummary(ownerWaNorm) {
     );
   }
 
-  return formatMonthlySummaryBySubmissionContact(monthName, rows, grandTotal, footnotes);
+  return formatMonthlySummaryBySubmissionContact(monthName, rows, footnotes);
 }
 
 async function buildMonthlyStats(ownerWaNorm) {
@@ -2001,6 +2022,7 @@ const EXPENSE_INTERACTIVE_STATES = new Set([
   'AWAITING_EXPENSE_DETAILS',
   'AWAITING_CATEGORY_CLARIFICATION',
   'AWAITING_CATEGORY_CONFIRM',
+  'AWAITING_KIBBUTZ_DISAMBIG',
   'AWAITING_DAILY_REPLY',
 ]);
 
@@ -2225,19 +2247,63 @@ async function beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick
   else if (res && !res.headersSent) sendTwiML(res, fallback);
 }
 
-/** רישום מיידי לפי kibbutzData — דילוג על אישור קטגוריה */
-async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pick, lower, opts = {}) {
+/** כמה נושאים אפשריים — בוחרים במספר או בשם */
+async function startKibbutzDisambiguation(
+  res,
+  phone,
+  waNorm,
+  userSheetValue,
+  pick,
+  lower,
+  matches,
+  mode,
+  opts = {}
+) {
   const useOutboundApi = !!opts.useOutboundApi;
   const twimlAlreadyEmpty = !!opts.twimlAlreadyEmpty;
-  const desc = (pick.desc || '').trim();
-  const entry = findKibbutzEntryForText(desc.toLowerCase(), lower);
-  if (!entry) return false;
+  void userSheetValue;
+  void lower;
+  resetSession(phone);
+  const s = getSession(phone);
+  s.state = 'AWAITING_KIBBUTZ_DISAMBIG';
+  s.kibbutzDisambig = {
+    mode,
+    pendingPick: pick,
+    matches: matches.map((e) => serializeDisambigEntry(e)),
+  };
+  s.ts = Date.now();
+  const lines = ['*מצאתי כמה נושאים רלוונטיים:*', ''];
+  matches.forEach((e, i) => lines.push(`(${i + 1}) *${e.topic}*`));
+  lines.push(
+    '',
+    `במה מעניין אותך? שלח *מספר* (1–${matches.length}) או חלק מ*שם הנושא*.`,
+    '',
+    '*ביטול* ליציאה.'
+  );
+  const msg = lines.join('\n');
+  if (useOutboundApi && waNorm) {
+    if (!twimlAlreadyEmpty && res && !res.headersSent) emptyTwiMLResponse(res);
+    await replyWhatsAppToUser(waNorm, msg);
+  } else if (res && !res.headersSent) {
+    sendTwiML(res, msg);
+  }
+  return true;
+}
 
+/** שמירה + תשובה אחרי זיהוי נושא יחיד מ־kibbutzData */
+async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userSheetValue, pick, entry, opts = {}) {
+  const useOutboundApi = !!opts.useOutboundApi;
+  const twimlAlreadyEmpty = !!opts.twimlAlreadyEmpty;
   const amount = pick.amount;
+  const desc = (pick.desc || '').trim();
   const topic = entry.topic;
-  const contact = extractSubmissionContacts(entry.answer);
-  const capInfo = findBreachedPolicyCap(amount, entry.answer);
-  const capNote = capInfo ? capInfo.note : '';
+  const contact =
+    (entry.contact && String(entry.contact).trim()) || extractSubmissionContacts(entry.answer || '');
+  const lim = Number(entry.limit);
+  const refund = estimatedRefund(amount, lim);
+  const refundDisp = formatShekelDisplay(refund);
+  const limitDisp = Number.isFinite(lim) && lim > 0 ? formatShekelDisplay(lim) : '—';
+  const capNote = capNoteFromEntry(amount, entry);
   const dupLine = await duplicateExpenseWarningLine(waNorm, amount, topic);
   const receiptImage = (pick.receiptImage || '').trim();
 
@@ -2249,7 +2315,12 @@ async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue,
     s.pendingDesc = desc;
     s.pendingCategory = topic;
     s.pendingDriveLink = receiptImage;
-    s.pendingKibbutzSmartAnswer = entry.answer;
+    s.pendingKibbutzSmartSnapshot = JSON.stringify({
+      topic: entry.topic,
+      limit: entry.limit,
+      contact,
+      answer: entry.answer || '',
+    });
     s.ts = Date.now();
     const msg = `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`;
     if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, msg);
@@ -2263,7 +2334,15 @@ async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue,
       submissionContact: contact,
     });
     resetSession(phone);
-    const reply = buildSmartLogReply(formatShekelDisplay(amount), topic, contact, capNote, dupLine);
+    const reply = buildSmartLogReply({
+      amountDisplay: formatShekelDisplay(amount),
+      limitDisplay: limitDisp,
+      refundDisplay: refundDisp,
+      topic,
+      contact,
+      capNote,
+      dupSuffix: dupLine,
+    });
     if (receiptImage) {
       if (!twimlAlreadyEmpty && res && !res.headersSent) emptyTwiMLResponse(res);
       await sendReceiptSuccessQuickReply(waNorm, reply);
@@ -2282,6 +2361,48 @@ async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue,
     else if (res && !res.headersSent) sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
     return true;
   }
+}
+
+/** שאילתת מידע בלי סכום — תשובה מלאה או בירור */
+async function tryHandleKibbutzInquiry(res, phone, waNorm, userSheetValue, lower) {
+  const matches = findKibbutzMatches('', lower);
+  if (matches.length === 0) return false;
+  if (matches.length === 1) {
+    sendTwiML(res, formatKibbutzKnowledgeAnswer(matches[0].answer));
+    return true;
+  }
+  return startKibbutzDisambiguation(
+    res,
+    phone,
+    waNorm,
+    userSheetValue,
+    null,
+    lower,
+    matches,
+    'inquiry',
+    {}
+  );
+}
+
+/** רישום מיידי לפי kibbutzData — דילוג על אישור קטגוריה */
+async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pick, lower, opts = {}) {
+  const desc = (pick.desc || '').trim();
+  const matches = findKibbutzMatches(desc.toLowerCase(), lower);
+  if (matches.length === 0) return false;
+  if (matches.length > 1) {
+    return startKibbutzDisambiguation(
+      res,
+      phone,
+      waNorm,
+      userSheetValue,
+      pick,
+      lower,
+      matches,
+      'expense',
+      opts
+    );
+  }
+  return completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userSheetValue, pick, matches[0], opts);
 }
 
 async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category) {
@@ -2576,9 +2697,7 @@ app.post('/whatsapp', async (req, res) => {
       !Number.isNaN(expenseProbe.amount) &&
       expenseProbe.amount > 0;
     if (!looksLikeExpenseReport) {
-      const knowledgeReply = matchKibbutzKnowledge(lower);
-      if (knowledgeReply) {
-        sendTwiML(res, knowledgeReply);
+      if (await tryHandleKibbutzInquiry(res, phone, waNorm, userSheetValue, lower)) {
         return;
       }
     }
@@ -2614,6 +2733,41 @@ app.post('/whatsapp', async (req, res) => {
       return;
     }
     sendTwiML(res, 'עדיין מחכה לאישור הקטגוריה — כפתור או *כן* / *לא*.');
+    return;
+  }
+
+  // ─── AWAITING_KIBBUTZ_DISAMBIG (כמה נושאים מ־kibbutzData) ───
+  if (session.state === 'AWAITING_KIBBUTZ_DISAMBIG') {
+    const kd = session.kibbutzDisambig;
+    if (!kd || !Array.isArray(kd.matches) || kd.matches.length === 0) {
+      resetSession(phone);
+      sendTwiML(res, 'פג תוקף — נסה שוב.');
+      return;
+    }
+    if (lower === 'ביטול' || lower === 'בטל') {
+      resetSession(phone);
+      sendTwiML(res, 'בוטל.');
+      return;
+    }
+    const idx = resolveKibbutzDisambigIndex(trimmed, kd.matches);
+    if (idx < 0) {
+      sendTwiML(res, 'לא הבנתי. שלח *מספר* מהרשימה או *ביטול*.');
+      return;
+    }
+    const entry = kd.matches[idx];
+    if (kd.mode === 'inquiry') {
+      resetSession(phone);
+      sendTwiML(res, formatKibbutzKnowledgeAnswer(entry.answer));
+      return;
+    }
+    const pick = kd.pendingPick;
+    if (!pick || typeof pick.amount !== 'number' || Number.isNaN(pick.amount)) {
+      resetSession(phone);
+      sendTwiML(res, 'חסרים נתוני רישום — שלח שוב *סכום + תיאור*.');
+      return;
+    }
+    resetSession(phone);
+    await completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userSheetValue, pick, entry, {});
     return;
   }
 
@@ -3442,7 +3596,7 @@ app.post('/whatsapp', async (req, res) => {
       pendingDesc,
       pendingCategory,
       pendingDriveLink,
-      pendingKibbutzSmartAnswer,
+      pendingKibbutzSmartSnapshot,
     } = s;
     if (matchesAny(lower, INTENT_CONFIRM_YES)) {
       if (!pendingCategory) {
@@ -3454,10 +3608,20 @@ app.post('/whatsapp', async (req, res) => {
       try {
         const hasImage = !!pendingDriveLink;
         const dupLine = await duplicateExpenseWarningLine(waNorm, pendingAmount, pendingCategory);
-        if (pendingKibbutzSmartAnswer) {
-          const contact = extractSubmissionContacts(pendingKibbutzSmartAnswer);
-          const capInfo = findBreachedPolicyCap(pendingAmount, pendingKibbutzSmartAnswer);
-          const capNote = capInfo ? capInfo.note : '';
+        if (pendingKibbutzSmartSnapshot) {
+          let snap = null;
+          try {
+            snap = JSON.parse(pendingKibbutzSmartSnapshot);
+          } catch (_) {
+            snap = null;
+          }
+          const contact =
+            (snap && snap.contact) || extractSubmissionContacts((snap && snap.answer) || '');
+          const lim = snap != null ? Number(snap.limit) : NaN;
+          const refund = estimatedRefund(pendingAmount, lim);
+          const refundDisp = formatShekelDisplay(refund);
+          const limitDisp = Number.isFinite(lim) && lim > 0 ? formatShekelDisplay(lim) : '—';
+          const capNote = capNoteFromEntry(pendingAmount, { limit: lim });
           const rowIdx = await saveFullRow(
             phone,
             userSheetValue,
@@ -3467,13 +3631,15 @@ app.post('/whatsapp', async (req, res) => {
             pendingDriveLink || '',
             { topic: pendingCategory, submissionContact: contact }
           );
-          const reply = buildSmartLogReply(
-            formatShekelDisplay(pendingAmount),
-            pendingCategory,
+          const reply = buildSmartLogReply({
+            amountDisplay: formatShekelDisplay(pendingAmount),
+            limitDisplay: limitDisp,
+            refundDisplay: refundDisp,
+            topic: pendingCategory,
             contact,
             capNote,
-            dupLine
-          );
+            dupSuffix: dupLine,
+          });
           if (hasImage) {
             emptyTwiMLResponse(res);
             await sendReceiptSuccessQuickReply(waNorm, reply);
@@ -3739,10 +3905,7 @@ function runLocalUnitChecks() {
   const ks = require('./kibbutzSmart');
   const hairEntry = ks.findKibbutzEntryForText('תספורת', '400 תספורת');
   t('kibbutz smart topic תספורת', hairEntry?.topic === 'תספורת וקוסמטיקה');
-  t(
-    'kibbutz smart cap breach',
-    !!ks.findBreachedPolicyCap(400, hairEntry?.answer || '')
-  );
+  t('kibbutz cap note over limit', !!(hairEntry && ks.capNoteFromEntry(400, hairEntry)));
   const a = parseExpenseMessage('150 דלק');
   t('parse "150 דלק"', a.amount === 150 && a.description === 'דלק');
   const b = parseExpenseMessage('הוצאתי 50 שקל על דלק');
