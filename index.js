@@ -27,11 +27,11 @@ const {
   potentialRefundForAmountAndTopic,
 } = require('./kibbutzSmart');
 const {
-  runGeminiKibbutzTurn,
   isGeminiApiKeyConfigured,
   GEMINI_API_VERSION,
   MODEL_NAME: GEMINI_MODEL_NAME,
 } = require('./geminiKibbutzAssistant');
+const { runGeminiWithKibbutzContext } = require('./handleMessage');
 const kibbutzData = require('./kibbutzData');
 
 const app = express();
@@ -279,6 +279,17 @@ function loadGoogleServiceAccountCreds() {
     } catch (e) {
       console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:', e.message);
     }
+  }
+
+  /** Render / פריסה מינימלית: אימייל שירות + מפתח PEM (עם \\n) — בלי קובץ JSON מלא */
+  const envEmailOnly = (process.env.GOOGLE_CLIENT_EMAIL || '').trim();
+  const envPkOnly = (process.env.GOOGLE_PRIVATE_KEY || '').trim();
+  if (envEmailOnly.includes('@') && envPkOnly.includes('BEGIN')) {
+    serviceAccountLoadSource = 'GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY (env only)';
+    return finalizeServiceAccountCredentials({
+      client_email: envEmailOnly,
+      private_key: envPkOnly,
+    });
   }
 
   return null;
@@ -2797,6 +2808,9 @@ function logConfigOnce() {
   console.log('[config] GOOGLE_SHEET_ID:', GOOGLE_SHEET_ID || '(missing)');
   console.log('[config] GOOGLE_DRIVE_FOLDER_ID:', GOOGLE_DRIVE_FOLDER_ID || '(not set — Drive receipt uploads disabled)');
   console.log('[config] Google SA source:', serviceAccountLoadSource);
+  if (String(serviceAccountLoadSource).includes('GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY')) {
+    console.log('[config] (Render) credentials from GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY only');
+  }
   console.log('[config] Google SA:', serviceAccountCreds ? 'loaded' : '(missing)');
   console.log('[config] Drive client:', getDriveClient() ? 'ready' : '(disabled)');
   console.log('[config] Twilio client:', twilioClient ? 'ready' : '(disabled)');
@@ -2843,7 +2857,11 @@ app.get('/__media/chart/:token', (req, res) => {
   res.send(rec.buffer);
 });
 
-async function handleWhatsAppMessage(req, res) {
+/**
+ * נקודת הכניסה ל-POST /whatsapp — כל מכונת המצבים, גיליון, דרייב ומדיה.
+ * שכבת Gemini היציבה (פרומפט + ללא systemInstruction): `./handleMessage.js` → runGeminiWithKibbutzContext.
+ */
+async function handleMessage(req, res) {
   const ctx = buildWhatsAppContext(req);
   const bodyRaw = req.body.Body ?? '';
   const numMedia = parseInt(req.body.NumMedia || '0', 10);
@@ -4004,8 +4022,19 @@ async function handleWhatsAppMessage(req, res) {
     !ib.categoryPayload
   ) {
     try {
-      const geminiOut = await runGeminiKibbutzTurn(trimmed, { hasMedia: false });
-      await applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, geminiOut, trimmed);
+      const geminiOut = await runGeminiWithKibbutzContext(trimmed, { hasMedia: false });
+      if (!geminiOut.ok) {
+        sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+        return;
+      }
+      await applyGeminiWhatsAppResult(
+        res,
+        phone,
+        waNorm,
+        userSheetValue,
+        { reply: geminiOut.reply, log_expense: false },
+        trimmed
+      );
     } catch (e) {
       console.error('[gemini]', e && e.message ? e.message : e);
       sendTwiML(res, USER_FACING_TECH_ERROR_HE);
@@ -4093,7 +4122,7 @@ async function handleWhatsAppMessage(req, res) {
 
 app.post('/whatsapp', async (req, res) => {
   try {
-    await handleWhatsAppMessage(req, res);
+    await handleMessage(req, res);
   } catch (err) {
     console.error('[whatsapp] unhandled error:', err && err.stack ? err.stack : err);
     if (!res.headersSent) {
