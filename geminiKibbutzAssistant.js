@@ -1,12 +1,15 @@
 /**
- * Gemini — Google AI, REST v1. תשובה טקסטual בלבד (ללא responseMimeType / JSON schema).
+ * Gemini — Google Generative Language API. תשובה טקסט בלבד.
+ * ברירת מחדל: v1beta (תואם @google/generative-ai ורוב מפתחות AI Studio). ניתן לכפות v1 עם GEMINI_API_VERSION=v1.
  */
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
 
-const GEMINI_API_VERSION = 'v1';
 const MODEL_NAME = 'gemini-1.5-flash';
+
+/** v1beta נתמך היטב ע״י הספרייה; v1 לפי דרישה (מונע 404 אצל חלק מהמפתחות) */
+const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || 'v1beta').trim() || 'v1beta';
 
 function buildSystemInstruction() {
   const contextJson = JSON.stringify(kibbutzData, null, 2);
@@ -76,9 +79,32 @@ function isGeminiApiKeyConfigured() {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
+/** הודעת WhatsApp בעברית לפי שגיאת API */
+function getGeminiUserFacingError(err) {
+  const m = String(err && err.message != null ? err.message : err || '');
+  if (/GEMINI_API_KEY|missing|empty in process\.env/i.test(m)) {
+    return 'חסר מפתח API לעוזר (*GEMINI_API_KEY*). הגדר אותו במשתני הסביבה של השרת ופרוס מחדש.';
+  }
+  if (/404|not found|NotFound|is not found/i.test(m)) {
+    return (
+      '*Gemini — לא נמצא המודל (404).*\n\n' +
+      'בדוק את *GEMINI_API_KEY*. אם השתמשת ב־*GEMINI_API_VERSION=v1*, נסה להסיר אותו (ברירת המחדל v1beta) או לעדכן מודל.'
+    );
+  }
+  if (/403|PERMISSION|permission denied|unregistered caller/i.test(m)) {
+    return '*Gemini — הגישה נדחתה (403).*\n\nבדוק שהמפתח תקף ב-Google AI Studio ושה-API מופעל לפרויקט.';
+  }
+  if (/429|rate|quota/i.test(m)) {
+    return '*Gemini — יותר מדי בקשות (quota).* נסה שוב בעוד רגע.';
+  }
+  const short = m.replace(/\s+/g, ' ').trim().slice(0, 180);
+  return `*שגיאה בחיבור לעוזר (Gemini)*\n\n${short || 'שגיאה לא ידועה'}\n\nנסה שוב או שלח *סכום + תיאור* בלי העוזר.`;
+}
+
 module.exports = {
   runGeminiKibbutzTurn,
   isGeminiApiKeyConfigured,
+  getGeminiUserFacingError,
   MODEL_NAME,
   GEMINI_API_VERSION,
 };

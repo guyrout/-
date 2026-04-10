@@ -29,6 +29,7 @@ const {
 const {
   runGeminiKibbutzTurn,
   isGeminiApiKeyConfigured,
+  getGeminiUserFacingError,
   GEMINI_API_VERSION,
   MODEL_NAME: GEMINI_MODEL_NAME,
 } = require('./geminiKibbutzAssistant');
@@ -194,17 +195,77 @@ function buildWhatsAppContext(req) {
 
 // ===================== Google Service Account =====================
 
+/** מקור טעינת ה-JSON — לוג בלבד */
+let serviceAccountLoadSource = '(none)';
+
+function isValidServiceAccountJson(obj) {
+  return (
+    obj &&
+    typeof obj.client_email === 'string' &&
+    obj.client_email.includes('@') &&
+    typeof obj.private_key === 'string' &&
+    obj.private_key.includes('BEGIN')
+  );
+}
+
 function loadGoogleServiceAccountCreds() {
   const localPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
   if (fs.existsSync(localPath)) {
-    try { return require('./Expense-Tracker-Bot.json'); }
-    catch (e) { console.error('[config] Expense-Tracker-Bot.json:', e.message); }
+    try {
+      const j = JSON.parse(fs.readFileSync(localPath, 'utf8'));
+      if (isValidServiceAccountJson(j)) {
+        serviceAccountLoadSource = 'Expense-Tracker-Bot.json (local file)';
+        return j;
+      }
+      console.error('[config] local SA file: invalid (need client_email + private_key)');
+    } catch (e) {
+      console.error('[config] Expense-Tracker-Bot.json:', e.message);
+    }
   }
+
+  const gacPath = (process.env.GOOGLE_APPLICATION_CREDENTIALS || '').trim();
+  if (gacPath && fs.existsSync(gacPath)) {
+    try {
+      const j = JSON.parse(fs.readFileSync(gacPath, 'utf8'));
+      if (isValidServiceAccountJson(j)) {
+        serviceAccountLoadSource = 'GOOGLE_APPLICATION_CREDENTIALS (file path)';
+        return j;
+      }
+      console.error('[config] GOOGLE_APPLICATION_CREDENTIALS: invalid JSON shape');
+    } catch (e) {
+      console.error('[config] GOOGLE_APPLICATION_CREDENTIALS:', e.message);
+    }
+  }
+
   const raw = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
   if (raw) {
-    try { return JSON.parse(raw); }
-    catch (e) { console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON:', e.message); }
+    try {
+      const j = JSON.parse(raw);
+      if (isValidServiceAccountJson(j)) {
+        serviceAccountLoadSource = 'GOOGLE_SERVICE_ACCOUNT_JSON (env string)';
+        return j;
+      }
+      console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON: invalid shape after parse');
+    } catch (e) {
+      console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON parse:', e.message);
+    }
   }
+
+  const b64 = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 || '').trim();
+  if (b64) {
+    try {
+      const decoded = Buffer.from(b64, 'base64').toString('utf8');
+      const j = JSON.parse(decoded);
+      if (isValidServiceAccountJson(j)) {
+        serviceAccountLoadSource = 'GOOGLE_SERVICE_ACCOUNT_JSON_BASE64';
+        return j;
+      }
+      console.error('[config] BASE64 SA: invalid shape after decode');
+    } catch (e) {
+      console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:', e.message);
+    }
+  }
+
   return null;
 }
 
@@ -277,17 +338,30 @@ function bufferToStream(buf) {
 /**
  * Upload bytes to Drive. Files stay private (no link sharing / no "anyone").
  * Only accounts with access to GOOGLE_DRIVE_FOLDER_ID (owner + service account) can open them.
+ * @returns {{ link: string | null, userMessage: string | null }} userMessage בעברית כשההעלאה נכשלה
  */
 async function uploadToDrive(buffer, contentType, fileName) {
+  if (!serviceAccountCreds) {
+    const msg =
+      '*דרייב — לא הוגדר חשבון שירות Google.*\n\n' +
+      'הגדר אחד מהבאים בשרת: *GOOGLE_SERVICE_ACCOUNT_JSON* (מחרוזת JSON מלאה), ' +
+      '*GOOGLE_SERVICE_ACCOUNT_JSON_BASE64*, או נתיב קובץ ב-*GOOGLE_APPLICATION_CREDENTIALS*.';
+    console.error('[drive] no service account — check env');
+    return { link: null, userMessage: msg };
+  }
   const drive = getDriveClient();
   if (!drive) {
-    console.error('[drive] Drive upload failed: no Drive client (check service account)');
-    return null;
+    const msg =
+      '*דרייב — לא ניתן ליצור לקוח Drive.*\n\nבדוק שה-JSON כולל *client_email* ו-*private_key* תקינים.';
+    return { link: null, userMessage: msg };
   }
   const folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
   if (!folderId) {
-    console.error('[drive] Drive upload failed: GOOGLE_DRIVE_FOLDER_ID is not set');
-    return null;
+    const msg =
+      '*דרייב — חסר GOOGLE_DRIVE_FOLDER_ID.*\n\n' +
+      'הוסף במשתני הסביבה את מזהה התיקייה (מקשר לתיקייה ב-Drive) ושתף את חשבון השירות כעורך בתיקייה.';
+    console.error('[drive] GOOGLE_DRIVE_FOLDER_ID not set');
+    return { link: null, userMessage: msg };
   }
 
   console.log('[drive] Drive upload started:', fileName, `(${buffer.length} bytes)`);
@@ -306,20 +380,34 @@ async function uploadToDrive(buffer, contentType, fileName) {
     const webViewLink =
       createRes.data.webViewLink || (id ? `https://drive.google.com/file/d/${id}/view` : null);
     console.log('[drive] Drive upload finished: fileId=', id, 'webViewLink=', webViewLink ? '(set)' : '(missing)');
-    return webViewLink;
+    return { link: webViewLink || null, userMessage: null };
   } catch (error) {
-    console.error('DRIVE ERROR DETAILS:', error.response ? error.response.data : error.message);
-    return null;
+    const api = error.response?.data?.error;
+    const detail = api?.message || error.message || 'unknown';
+    console.error('[drive] API error:', error.response?.data || error.message);
+    const msg =
+      `*העלאה לדרייב נכשלה.*\n\n${String(detail).slice(0, 280)}\n\n` +
+      'בדוק: חשבון השירות הוא *עורך* על התיקייה, ה-API של Drive מופעל, והמכסה לא חרגה.';
+    return { link: null, userMessage: msg };
   }
 }
 
+/**
+ * מוריד מדיה מ-Twilio ומעלה לדרייב.
+ * @returns {{ link: string | null, userMessage: string | null }} userMessage מפורט אם נכשל
+ */
 async function handleMediaUpload(req, fileBaseName) {
   const numMedia = parseInt(req.body.NumMedia || '0', 10);
-  if (numMedia === 0) return null;
+  if (numMedia === 0) return { link: null, userMessage: null };
 
   const mediaUrl = req.body.MediaUrl0;
   const mediaType = req.body.MediaContentType0 || 'image/jpeg';
-  if (!mediaUrl) return null;
+  if (!mediaUrl) {
+    return {
+      link: null,
+      userMessage: '*קבלה — לא התקבל קישור למדיה מ-WhatsApp.* נסה לשלוח את התמונה שוב.',
+    };
+  }
 
   console.log('[media] Image detected, MediaContentType0=', mediaType);
   try {
@@ -333,14 +421,19 @@ async function handleMediaUpload(req, fileBaseName) {
       .replace(/_+/g, '_')
       .slice(0, 80) || 'Receipt';
     const fileName = `${safeBase}_${dd}_${mm}.${ext}`;
-    const link = await uploadToDrive(buffer, contentType, fileName);
-    return link;
+    const up = await uploadToDrive(buffer, contentType, fileName);
+    if (!up.link) {
+      return { link: null, userMessage: up.userMessage || DRIVE_UPLOAD_FAIL_USER_MSG };
+    }
+    return { link: up.link, userMessage: null };
   } catch (e) {
-    console.error(
-      '[media] Download/upload failed:',
-      e.response ? e.response.data : e.message
-    );
-    return null;
+    const errDetail = e.response?.data ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
+    console.error('[media] Download/upload failed:', errDetail);
+    const msg =
+      e.message && /Twilio credentials/i.test(e.message)
+        ? '*לא ניתן להוריד את הקובץ מ-WhatsApp:* חסרים TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN בשרת.'
+        : `*לא ניתן להוריד את הקובץ מהודעה:* ${String(e.message || 'שגיאה').slice(0, 200)}`;
+    return { link: null, userMessage: msg };
   }
 }
 
@@ -2663,6 +2756,7 @@ function logConfigOnce() {
   console.log('[config] TO_WHATSAPP_NUMBER:', TO_WHATSAPP_NUMBER || '(missing)');
   console.log('[config] GOOGLE_SHEET_ID:', GOOGLE_SHEET_ID || '(missing)');
   console.log('[config] GOOGLE_DRIVE_FOLDER_ID:', GOOGLE_DRIVE_FOLDER_ID || '(not set — Drive receipt uploads disabled)');
+  console.log('[config] Google SA source:', serviceAccountLoadSource);
   console.log('[config] Google SA:', serviceAccountCreds ? 'loaded' : '(missing)');
   console.log('[config] Drive client:', getDriveClient() ? 'ready' : '(disabled)');
   console.log('[config] Twilio client:', twilioClient ? 'ready' : '(disabled)');
@@ -2947,13 +3041,13 @@ app.post('/whatsapp', async (req, res) => {
           try {
             await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
             const oldLink = us.managementEditRow?.receiptImage || '';
-            const driveLink = await handleMediaUpload(req, receiptFileBase);
+            const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
             if (driveLink && oldLink) await deleteDriveFileByUrl(oldLink);
             await updateRowDriveAndLegacy(rowNum, waNorm, driveLink || oldLink || '');
             await refreshManagementEditSnapshot(phone, waNorm);
             session.state = 'MANAGEMENT_EDIT_MENU';
             touchMgmt();
-            const warn = !driveLink ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}` : '';
+            const warn = !driveLink ? `\n\n${driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG}` : '';
             await replyWhatsAppToUser(waNorm, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
           } catch (e) {
             console.error('[whatsapp] mgmt receipt upload:', e.message);
@@ -3036,17 +3130,18 @@ app.post('/whatsapp', async (req, res) => {
           try {
             await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
             const oldLink = us.managementEditRow?.receiptImage || '';
-            const driveLink = await handleMediaUpload(req, receiptFileBase);
+            const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
             if (oldLink && driveLink) await deleteDriveFileByUrl(oldLink);
             const finalImg = driveLink || oldLink;
             await updateRowDriveAndLegacy(rowNum, waNorm, finalImg || '');
             await refreshManagementEditSnapshot(phone, waNorm);
             touchMgmt();
+            const failMsg = driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG;
             const warn =
               !driveLink && !oldLink
-                ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}`
+                ? `\n\n${failMsg}`
                 : !driveLink
-                  ? `\n\n${DRIVE_UPLOAD_FAIL_USER_MSG}\n(נשמר הקישור הקודם אם היה.)`
+                  ? `\n\n${failMsg}\n(נשמר הקישור הקודם אם היה.)`
                   : '';
             await replyWhatsAppToUser(waNorm, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
           } catch (e) {
@@ -3271,7 +3366,7 @@ app.post('/whatsapp', async (req, res) => {
       void (async () => {
         try {
           await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
-          const driveLink = await handleMediaUpload(req, receiptFileBase);
+          const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
           if (rowIdx) await updateRowDriveAndLegacy(rowIdx, waNorm, driveLink || '');
           resetSession(phone);
           if (driveLink && rowIdx) {
@@ -3296,7 +3391,7 @@ app.post('/whatsapp', async (req, res) => {
           } else {
             await replyWhatsAppToUser(
               waNorm,
-              `${DRIVE_UPLOAD_FAIL_USER_MSG}\n\n(הרישום נשמר בלי קובץ בדרייב. לביטול — *מחק*)`
+              `${driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG}\n\n(הרישום נשמר בלי קובץ בדרייב. לביטול — *מחק*)`
             );
           }
         } catch (e) {
@@ -3388,7 +3483,10 @@ app.post('/whatsapp', async (req, res) => {
       void (async () => {
         try {
           await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
-          const driveLink = await handleMediaUpload(req, receiptFileBase);
+          const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
+          if (!driveLink && driveUserMsg) {
+            await replyWhatsAppToUser(waNorm, driveUserMsg);
+          }
           const msgLower = `${String(trimmed || '').toLowerCase()} ${desc.toLowerCase()}`;
           const pickSmartA = {
             amount,
@@ -3446,7 +3544,7 @@ app.post('/whatsapp', async (req, res) => {
     void (async () => {
       try {
         await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
-        const driveLink = await handleMediaUpload(req, receiptFileBase);
+        const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
         const s0 = getSession(phone);
         s0.state = 'AWAITING_EXPENSE_DETAILS';
         s0.pendingDriveLink = driveLink || '';
@@ -3459,7 +3557,7 @@ app.post('/whatsapp', async (req, res) => {
         } else {
           await replyWhatsAppToUser(
             waNorm,
-            `${DRIVE_UPLOAD_FAIL_USER_MSG}\n\nשלח שוב *תמונת קבלה*, ואז *סכום + תיאור*.`
+            `${driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG}\n\nשלח שוב *תמונת קבלה*, ואז *סכום + תיאור*.`
           );
         }
       } catch (e) {
@@ -3876,10 +3974,7 @@ app.post('/whatsapp', async (req, res) => {
       await applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, geminiOut, trimmed);
     } catch (e) {
       console.error('[gemini]', e && e.message ? e.message : e);
-      sendTwiML(
-        res,
-        'הממ… לא הצלחתי לעבד את זה עכשיו 🤔 תוכל לנסות שוב בעוד רגע, או לכתוב *סכום + תיאור* בקצרה?'
-      );
+      sendTwiML(res, getGeminiUserFacingError(e));
     }
     return;
   }
