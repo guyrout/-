@@ -97,7 +97,17 @@ async function runGeminiKibbutzTurn(userMessage, options = {}) {
   }
 
   const result = await model.generateContent(prompt);
-  const raw = result.response.text();
+  let raw;
+  try {
+    raw = result.response.text();
+  } catch (e) {
+    const block = result.response?.promptFeedback?.blockReason;
+    const msg = block ? `blocked (${block})` : e && e.message ? e.message : String(e);
+    throw new Error(`gemini: no text in response — ${msg}`);
+  }
+  if (raw == null || !String(raw).trim()) {
+    throw new Error('gemini: empty model output');
+  }
   const parsed = parseJsonFromModelText(raw);
   if (typeof parsed.reply !== 'string') parsed.reply = 'היי! 😊 לא הבנתי בדיוק — תוכל לפרט?';
   if (typeof parsed.log_expense !== 'boolean') parsed.log_expense = false;

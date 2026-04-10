@@ -103,7 +103,9 @@ let contentSidCategoryConfirm = (process.env.TWILIO_CONTENT_SID_CATEGORY_CONFIRM
 let contentTemplatesInitPromise = null;
 
 function fmtWA(num) {
-  return num.startsWith('whatsapp:') ? num : `whatsapp:${num}`;
+  if (num == null || typeof num !== 'string' || !num.trim()) return '';
+  const n = num.trim();
+  return n.startsWith('whatsapp:') ? n : `whatsapp:${n}`;
 }
 
 // ===================== Access control & user identity =====================
@@ -1990,10 +1992,18 @@ async function buildMonthlyStats(ownerWaNorm) {
 
 async function sendWhatsAppMessage(to, body) {
   if (!twilioClient || !FROM_WHATSAPP_NUMBER) return;
+  const fromW = fmtWA(FROM_WHATSAPP_NUMBER);
+  const toW = fmtWA(to);
+  if (!fromW || !toW) {
+    console.error('[cron] sendWhatsAppMessage: missing from/to after fmtWA');
+    return;
+  }
   try {
-    await twilioClient.messages.create({ from: fmtWA(FROM_WHATSAPP_NUMBER), to: fmtWA(to), body });
+    await twilioClient.messages.create({ from: fromW, to: toW, body });
     console.log('[cron] Sent to', to, ':', body.slice(0, 60));
-  } catch (e) { console.error('[cron] Send failed:', e.message); }
+  } catch (e) {
+    console.error('[cron] Send failed:', e.message);
+  }
 }
 
 // ===================== Session State Machine =====================
@@ -2664,11 +2674,12 @@ function logConfigOnce() {
   const geminiEnv = process.env.GEMINI_API_KEY;
   const geminiOk = typeof geminiEnv === 'string' && geminiEnv.trim().length > 0;
   console.log('[config] GEMINI_API_KEY:', geminiOk ? '(set)' : '(not set — Gemini assistant disabled)');
-  console.log(
-    '[debug] GEMINI_API_KEY defined at startup:',
-    geminiOk,
-    geminiOk ? `(trimmed length ${geminiEnv.trim().length})` : '(set GEMINI_API_KEY in the host environment)'
-  );
+  if (process.env.DEBUG_GEMINI === '1') {
+    console.log(
+      '[debug] GEMINI_API_KEY:',
+      geminiOk ? `set (length ${geminiEnv.trim().length})` : 'MISSING'
+    );
+  }
 }
 logConfigOnce();
 
@@ -3558,9 +3569,23 @@ app.post('/whatsapp', async (req, res) => {
   // ─── SESSION STATES ───
 
   if (getSession(phone).state === 'AWAITING_DAILY_REPLY') {
-    resetSession(phone);
-    if (matchesAny(lower, INTENT_CONFIRM_YES)) { sendTwiML(res, 'מעולה! שלח את ההחזרים וארשום — לא מפספסים 📝'); return; }
-    if (matchesAny(lower, INTENT_CONFIRM_NO)) { sendTwiML(res, 'יופי, ערב טוב! 🌙'); return; }
+    if (matchesAny(lower, INTENT_CONFIRM_YES)) {
+      resetSession(phone);
+      sendTwiML(res, 'מעולה! שלח את ההחזרים וארשום — לא מפספסים 📝');
+      return;
+    }
+    if (matchesAny(lower, INTENT_CONFIRM_NO)) {
+      resetSession(phone);
+      sendTwiML(res, 'יופי, ערב טוב! 🌙');
+      return;
+    }
+    const sDaily = getSession(phone);
+    sDaily.ts = Date.now();
+    sendTwiML(
+      res,
+      'לא הבנתי — ענה *כן* או *לא* לגבי רישום החזרים להיום, או שלח *סיכום* / *עזרה*.'
+    );
+    return;
   }
 
   if (getSession(phone).state === 'AWAITING_DESCRIPTION') {
@@ -3946,7 +3971,7 @@ app.post('/webhook', async (req, res) => {
       sendTwiML(res, 'מצטער, אין לך הרשאה להשתמש במערכת זו.');
       return;
     }
-    const message = req.body.Body || '';
+    const message = String(req.body.Body ?? '').trim();
     const { amount, description } = parseExpenseMessage(message);
     if (amount) {
       const desc = description || '(ללא תיאור)';
