@@ -26,6 +26,8 @@ const {
   estimatedRefund,
   potentialRefundForAmountAndTopic,
 } = require('./kibbutzSmart');
+const { runGeminiKibbutzTurn } = require('./geminiKibbutzAssistant');
+const kibbutzData = require('./kibbutzData');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -84,6 +86,7 @@ const GOOGLE_SHEET_ID = (
 const GOOGLE_DRIVE_FOLDER_ID = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
 /** Public base URL (no trailing slash) so Twilio can fetch one-time chart PNGs from GET /__media/chart/:token */
 const PUBLIC_WEBHOOK_BASE = (process.env.PUBLIC_WEBHOOK_BASE || '').trim().replace(/\/$/, '');
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
@@ -2334,7 +2337,7 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
       submissionContact: contact,
     });
     resetSession(phone);
-    const reply = buildSmartLogReply({
+    const builtReply = buildSmartLogReply({
       amountDisplay: formatShekelDisplay(amount),
       limitDisplay: limitDisp,
       refundDisplay: refundDisp,
@@ -2343,6 +2346,13 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
       capNote,
       dupSuffix: dupLine,
     });
+    let reply =
+      opts.overrideReply != null && String(opts.overrideReply).trim()
+        ? String(opts.overrideReply).trim()
+        : builtReply;
+    if (opts.overrideReply != null && String(opts.overrideReply).trim() && dupLine) {
+      reply += dupLine;
+    }
     if (receiptImage) {
       if (!twimlAlreadyEmpty && res && !res.headersSent) emptyTwiMLResponse(res);
       await sendReceiptSuccessQuickReply(waNorm, reply);
@@ -2360,6 +2370,97 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
     if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, 'שגיאה בשמירה, נסה שוב');
     else if (res && !res.headersSent) sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
     return true;
+  }
+}
+
+/** תשובת Gemini (עברית) + רישום הוצאה לגיליון כש־log_expense */
+async function applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, g, userTrimmed) {
+  const fallbackClarify =
+    'הממ… לא הבנתי לגמרי 😅 תוכל לכתוב שוב בקצרה? (סכום + על מה, או שאלה על החזר)';
+  const replySafe =
+    g && typeof g.reply === 'string' && g.reply.trim() ? g.reply.trim() : fallbackClarify;
+
+  if (!g || !g.log_expense) {
+    sendTwiML(res, replySafe);
+    return;
+  }
+
+  const amount = Number(g.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    sendTwiML(res, replySafe);
+    return;
+  }
+
+  const desc = (g.expense_description || userTrimmed || '').trim() || '(ללא תיאור)';
+  const hayLower = `${desc} ${userTrimmed}`.toLowerCase();
+  const matches = findKibbutzMatches(desc.toLowerCase(), hayLower);
+
+  let entry = null;
+  if (g.topic && String(g.topic).trim()) {
+    entry = kibbutzData.find((e) => e.topic === String(g.topic).trim()) || null;
+  }
+  if (!entry && matches.length === 1) entry = matches[0];
+  if (!entry && matches.length > 1) {
+    const pick = {
+      amount,
+      desc,
+      userSheetValue,
+      receipt: 'No',
+      receiptImage: '',
+    };
+    await startKibbutzDisambiguation(res, phone, waNorm, userSheetValue, pick, hayLower, matches, 'expense', {});
+    return;
+  }
+
+  if (entry) {
+    await completeSmartExpenseFromKibbutzEntry(
+      res,
+      phone,
+      waNorm,
+      userSheetValue,
+      { amount, desc, userSheetValue, receipt: 'No', receiptImage: '' },
+      entry,
+      { overrideReply: replySafe }
+    );
+    return;
+  }
+
+  const cat = matchCategory(desc) || (g.topic && String(g.topic).trim()) || 'שונות';
+  const contact = (g.submission_contact && String(g.submission_contact).trim()) || '';
+
+  const dupLine = await duplicateExpenseWarningLine(waNorm, amount, cat);
+
+  if (amount > HIGH_AMOUNT_THRESHOLD) {
+    resetSession(phone);
+    const s = getSession(phone);
+    s.state = 'AWAITING_HIGH_CONFIRM';
+    s.pendingAmount = amount;
+    s.pendingDesc = desc;
+    s.pendingCategory = cat;
+    s.pendingDriveLink = '';
+    s.pendingKibbutzSmartSnapshot = '';
+    s.ts = Date.now();
+    sendTwiML(
+      res,
+      `${replySafe}\n\n*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
+    );
+    return;
+  }
+
+  try {
+    const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, cat, '', {
+      topic: (g.topic && String(g.topic).trim()) || cat,
+      submissionContact: contact,
+    });
+    resetSession(phone);
+    sendTwiML(res, `${replySafe}${dupLine}`);
+    const ns = getSession(phone);
+    ns.state = 'AWAITING_RECEIPT_IMAGE';
+    ns.receiptRowIndex = rowIdx;
+    ns.ts = Date.now();
+  } catch (e) {
+    console.error('[gemini] save failed:', e.message);
+    sendTwiML(res, 'אופס, משהו נתקע בשמירה 🙏 נסה שוב בעוד רגע?');
   }
 }
 
@@ -2558,6 +2659,7 @@ function logConfigOnce() {
     '[config] PUBLIC_WEBHOOK_BASE:',
     PUBLIC_WEBHOOK_BASE || '(not set — monthly chart may use direct QuickChart URL only)'
   );
+  console.log('[config] GEMINI_API_KEY:', GEMINI_API_KEY ? '(set)' : '(not set — Gemini assistant disabled)');
 }
 logConfigOnce();
 
@@ -2683,8 +2785,9 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  // ─── ידע סטטי (kibbutzData): רק טקסט בלי רישום הוצאה, מצב IDLE ───
+  // ─── ידע סטטי (kibbutzData): רק טקסט בלי רישום הוצאה, מצב IDLE (בלי Gemini) ───
   if (
+    !GEMINI_API_KEY &&
     session.state === 'IDLE' &&
     !hasMedia &&
     trimmed &&
@@ -3716,6 +3819,28 @@ app.post('/whatsapp', async (req, res) => {
       res,
       '*מטבע*\n\nרושמים ב-*ש״ח* בלבד.\n\nאם הסכום בש״ח — שלח בלי סימן מטבע זר.'
     );
+    return;
+  }
+
+  // ─── Gemini: כל הודעת טקסט ב־IDLE (אחרי פקודות/כוונות שכבר טופלו למעלה) ───
+  if (
+    GEMINI_API_KEY &&
+    session.state === 'IDLE' &&
+    !hasMedia &&
+    trimmed &&
+    !ib.btnPayload &&
+    !ib.categoryPayload
+  ) {
+    try {
+      const geminiOut = await runGeminiKibbutzTurn(GEMINI_API_KEY, trimmed, { hasMedia: false });
+      await applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, geminiOut, trimmed);
+    } catch (e) {
+      console.error('[gemini]', e && e.message ? e.message : e);
+      sendTwiML(
+        res,
+        'הממ… לא הצלחתי לעבד את זה עכשיו 🤔 תוכל לנסות שוב בעוד רגע, או לכתוב *סכום + תיאור* בקצרה?'
+      );
+    }
     return;
   }
 
