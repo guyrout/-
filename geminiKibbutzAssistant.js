@@ -1,66 +1,23 @@
 /**
- * עוזר קיבוץ מבוסס Gemini — ידע מ־kibbutzData בלבד, בתוך system prompt כ־CONTEXT.
+ * עוזר קיבוץ מבוסס Gemini — CONTEXT מ־kibbutzData בהוראות מערכת.
+ * מפתח: המתקשר מעביר process.env.GEMINI_API_KEY (ראה index.js).
  */
 
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
 
-/** Prefer -latest; bare gemini-1.5-flash often 404s on current Google AI endpoints. Override with GEMINI_MODEL. */
-const DEFAULT_MODEL = 'gemini-1.5-flash-latest';
+/** מזהה מודל יחיד — ללא fallback למודלים אחרים */
+const MODEL_ID = 'gemini-1.5-flash';
 
-/** Stable Flash on the live API when 1.5 aliases are retired (automatic retry on 404 only). */
-const FALLBACK_MODEL_ON_404 = 'gemini-2.5-flash';
-
-function isModelNotFoundError(err) {
-  if (!err) return false;
-  if (err.status === 404) return true;
-  return /404|\bnot found\b|is not found for API version/i.test(String(err.message || ''));
-}
-
-/**
- * Current API: GenerativeModel.generateContent — do not use legacy predict/generateMessage paths.
- */
-async function generateContentWithModel(genAI, modelId, systemInstruction, generationConfig, userPrompt) {
-  const model = genAI.getGenerativeModel({
-    model: modelId,
-    systemInstruction,
-    generationConfig,
-  });
-  return model.generateContent(userPrompt);
-}
-
-/** תוכן מלא של kibbutzData.js כמחרוזת JSON (מעוצב לקריאה במודל) */
-function stringifyKibbutzContext() {
-  return JSON.stringify(kibbutzData, null, 2);
-}
-
-/**
- * System prompt: הוראות + CONTEXT (כל ה־JSON מ־kibbutzData).
- */
-function buildSystemInstruction(contextJson) {
-  const ctx = String(contextJson || '').trim();
+function buildSystemInstruction() {
+  const contextLine = `CONTEXT: ${JSON.stringify(kibbutzData)}`;
   return [
-    'You are a professional Kibbutz Secretary. You have access to a specific list of refund rules (the CONTEXT provided below).',
+    contextLine,
     '',
-    'CONTEXT',
-    ctx,
+    'You are a professional Kibbutz Assistant. You MUST use the provided CONTEXT to answer users. If a user logs an expense (number + item), extract the amount and topic. If they ask a question, answer based ONLY on the context. If the topic is missing from context, say you don\'t know.',
     '',
-    'CRITICAL: Never use your general knowledge about kibbutzim. ONLY use the specific amounts, limits, topics, keywords, contacts, and answer texts from the CONTEXT JSON above.',
-    '',
-    'If the user asks about something NOT in the CONTEXT list (no reasonable match to any topic or keywords), set log_expense to false and set "reply" to exactly this Hebrew sentence:',
-    'לא מצאתי מידע על הנושא הזה בתקנון, כדאי לבדוק מול המזכירות.',
-    '',
-    'When a user logs an expense (typically a number plus what they spent on), find the most relevant topic in the CONTEXT by matching intent. Use the "topic" and "keywords" fields—even if the user\'s wording is not identical (e.g. "נעליים" may match orthotics / "מדרסים" if that is the closest relevant row in CONTEXT).',
-    'Always take limit and contact from the matched CONTEXT row. Set potential_refund = min(amount, that row\'s limit). Set submission_contact to that row\'s "contact". Set topic to that row\'s exact "topic" string.',
-    'Always include in "reply" the correct limit (תקרה) and contact person from the matched CONTEXT row when you discuss that topic or confirm an expense.',
-    '',
-    'Response format (Hebrew only in "reply"):',
-    '- Always respond in Hebrew in the "reply" field.',
-    '- If log_expense is true, summarize clearly: [Amount] נרשם עבור [Topic], החזר משוער: [refund vs limit—show your calculation], איש קשר: [Contact]. Use a friendly tone and emojis where appropriate.',
-    '- For informational questions, answer only from CONTEXT.',
-    '- If you do not understand, set log_expense false and ask a short clarifying question in Hebrew.',
-    '',
-    'Output must be JSON only, matching the response schema. When log_expense is true, fill expense_description with a short Hebrew description suitable for a spreadsheet note.',
+    'Always put the user-visible text in the JSON field "reply" (Hebrew). For a logged expense set log_expense to true and fill structured fields from CONTEXT where possible.',
+    'Output must be JSON only, matching the response schema.',
   ].join('\n');
 }
 
@@ -87,8 +44,7 @@ function responseSchema() {
     properties: {
       reply: {
         type: SchemaType.STRING,
-        description:
-          'Hebrew only. For expenses: amount registered for topic, estimated refund, contact. Friendly tone with emojis.',
+        description: 'Final Hebrew message to the user',
       },
       log_expense: {
         type: SchemaType.BOOLEAN,
@@ -98,12 +54,12 @@ function responseSchema() {
       topic: {
         type: SchemaType.STRING,
         nullable: true,
-        description: 'Exact "topic" string from the matched CONTEXT row',
+        description: 'Topic from CONTEXT when matched',
       },
       submission_contact: {
         type: SchemaType.STRING,
         nullable: true,
-        description: 'Exact "contact" from the matched CONTEXT row',
+        description: 'Contact from CONTEXT when matched',
       },
       expense_description: { type: SchemaType.STRING, nullable: true },
       potential_refund: { type: SchemaType.NUMBER, nullable: true },
@@ -113,64 +69,35 @@ function responseSchema() {
 }
 
 /**
- * @param {string} apiKey
+ * @param {string} apiKey — use process.env.GEMINI_API_KEY from the host app
  * @param {string} userMessage
  * @param {{ hasMedia?: boolean }} [options]
- * @returns {Promise<{
- *   reply: string,
- *   log_expense: boolean,
- *   amount?: number|null,
- *   topic?: string|null,
- *   submission_contact?: string|null,
- *   expense_description?: string|null,
- *   potential_refund?: number|null
- * }>}
  */
 async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
+  const key = String(apiKey || '').trim();
+  if (!key) {
+    throw new Error('gemini: GEMINI_API_KEY is missing');
+  }
+
   const { hasMedia = false } = options;
-  const preferredModel = (process.env.GEMINI_MODEL || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
-  const contextJson = stringifyKibbutzContext();
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const systemInstruction = buildSystemInstruction(contextJson);
-  const generationConfig = {
-    temperature: 0.35,
-    responseMimeType: 'application/json',
-    responseSchema: responseSchema(),
-  };
+  const genAI = new GoogleGenerativeAI(key);
+
+  const model = genAI.getGenerativeModel({
+    model: MODEL_ID,
+    systemInstruction: buildSystemInstruction(),
+    generationConfig: {
+      temperature: 0.35,
+      responseMimeType: 'application/json',
+      responseSchema: responseSchema(),
+    },
+  });
 
   let prompt = `USER_MESSAGE:\n${userMessage || '(ריק)'}`;
   if (hasMedia) {
-    prompt +=
-      '\n\n(המשתמש שלח גם קובץ מדיה/תמונה; אין לך גישה לתוכן התמונה — הסתמך רק על הטקסט למעלה וב־CONTEXT שבהוראות המערכת.)';
+    prompt += '\n\n(נשלחה גם מדיה — אין גישה לתוכן התמונה, רק הטקסט למעלה.)';
   }
 
-  let result;
-  try {
-    result = await generateContentWithModel(
-      genAI,
-      preferredModel,
-      systemInstruction,
-      generationConfig,
-      prompt
-    );
-  } catch (e) {
-    if (
-      !isModelNotFoundError(e) ||
-      preferredModel === FALLBACK_MODEL_ON_404
-    ) {
-      throw e;
-    }
-    console.warn(
-      `[gemini] model "${preferredModel}" not available (${e.status || '404'}), retrying "${FALLBACK_MODEL_ON_404}"`
-    );
-    result = await generateContentWithModel(
-      genAI,
-      FALLBACK_MODEL_ON_404,
-      systemInstruction,
-      generationConfig,
-      prompt
-    );
-  }
+  const result = await model.generateContent(prompt);
   const raw = result.response.text();
   const parsed = parseJsonFromModelText(raw);
   if (typeof parsed.reply !== 'string') parsed.reply = 'היי! 😊 לא הבנתי בדיוק — תוכל לפרט?';
@@ -180,7 +107,5 @@ async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
 
 module.exports = {
   runGeminiKibbutzTurn,
-  stringifyKibbutzContext,
-  DEFAULT_MODEL,
-  FALLBACK_MODEL_ON_404,
+  MODEL_ID,
 };

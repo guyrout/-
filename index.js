@@ -86,6 +86,7 @@ const GOOGLE_SHEET_ID = (
 const GOOGLE_DRIVE_FOLDER_ID = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
 /** Public base URL (no trailing slash) so Twilio can fetch one-time chart PNGs from GET /__media/chart/:token */
 const PUBLIC_WEBHOOK_BASE = (process.env.PUBLIC_WEBHOOK_BASE || '').trim().replace(/\/$/, '');
+/** מפתח Google AI Studio / Gemini — חובה לשילוב Gemini */
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 
 const twilioClient =
@@ -2373,7 +2374,10 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
   }
 }
 
-/** תשובת Gemini (עברית) + רישום הוצאה לגיליון כש־log_expense */
+/**
+ * מחזיר את טקסט Gemini למשתמש ב-sendTwiML (מקביל ל-sendText ב-WhatsApp דרך Twilio).
+ * log_expense: שמירה ב-saveFullRow או completeSmartExpenseFromKibbutzEntry לפני שליחת התשובה; סכום גבוה — שמירה רק אחרי אישור המשתמש.
+ */
 async function applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, g, userTrimmed) {
   const fallbackClarify =
     'הממ… לא הבנתי לגמרי 😅 תוכל לכתוב שוב בקצרה? (סכום + על מה, או שאלה על החזר)';
@@ -3822,7 +3826,7 @@ app.post('/whatsapp', async (req, res) => {
     return;
   }
 
-  // ─── Gemini: כל הודעת טקסט ב־IDLE (אחרי פקודות/כוונות שכבר טופלו למעלה) ───
+  // ─── Gemini: process.env.GEMINI_API_KEY — applyGeminiWhatsAppResult שולח את reply ב-sendTwiML (טקסט ל-WhatsApp); ברישום הוצאה נקרא saveFullRow / completeSmartExpenseFromKibbutzEntry לפני התשובה (חוץ מאישור סכום גבוה) ───
   if (
     GEMINI_API_KEY &&
     session.state === 'IDLE' &&
