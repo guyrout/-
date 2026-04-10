@@ -1,5 +1,5 @@
 /**
- * עוזר קיבוץ מבוסס Gemini — ידע מ־kibbutzData, פלט JSON מובנה.
+ * עוזר קיבוץ מבוסס Gemini — ידע מ־kibbutzData בלבד, בתוך system prompt כ־CONTEXT.
  */
 
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
@@ -7,15 +7,38 @@ const kibbutzData = require('./kibbutzData');
 
 const DEFAULT_MODEL = 'gemini-1.5-flash';
 
-function buildSystemInstruction() {
+/** תוכן מלא של kibbutzData.js כמחרוזת JSON (מעוצב לקריאה במודל) */
+function stringifyKibbutzContext() {
+  return JSON.stringify(kibbutzData, null, 2);
+}
+
+/**
+ * System prompt: הוראות + CONTEXT (כל ה־JSON מ־kibbutzData).
+ */
+function buildSystemInstruction(contextJson) {
+  const ctx = String(contextJson || '').trim();
   return [
-    'You are a helpful Kibbutz Assistant. Use the provided context (KIBBUTZ_KNOWLEDGE_JSON) to identify user intent.',
-    'If the user provides a number + item, it is an expense. Extract the amount (ILS), topic (match the closest row in the knowledge JSON), and calculate potential_refund as min(amount, limit) using that row\'s limit. Set submission_contact from the matched row\'s contact field.',
-    'If the user asks a question, answer accurately based only on the knowledge data. If the intent is unclear, set log_expense to false and ask a short clarifying question in Hebrew in "reply".',
-    'When log_expense is true, fill expense_description with a short Hebrew description suitable for a spreadsheet note.',
-    'The "reply" field must always be natural, friendly Hebrew with appropriate emojis.',
-    'Never invent policies or limits that are not in KIBBUTZ_KNOWLEDGE_JSON.',
-    'If you do not understand the message, set log_expense to false and politely ask what they meant in Hebrew.',
+    'You are a professional Kibbutz Secretary. You have access to a specific list of refund rules (the CONTEXT provided below).',
+    '',
+    'CONTEXT',
+    ctx,
+    '',
+    'CRITICAL: Never use your general knowledge about kibbutzim. ONLY use the specific amounts, limits, topics, keywords, contacts, and answer texts from the CONTEXT JSON above.',
+    '',
+    'If the user asks about something NOT in the CONTEXT list (no reasonable match to any topic or keywords), set log_expense to false and set "reply" to exactly this Hebrew sentence:',
+    'לא מצאתי מידע על הנושא הזה בתקנון, כדאי לבדוק מול המזכירות.',
+    '',
+    'When a user logs an expense (typically a number plus what they spent on), find the most relevant topic in the CONTEXT by matching intent. Use the "topic" and "keywords" fields—even if the user\'s wording is not identical (e.g. "נעליים" may match orthotics / "מדרסים" if that is the closest relevant row in CONTEXT).',
+    'Always take limit and contact from the matched CONTEXT row. Set potential_refund = min(amount, that row\'s limit). Set submission_contact to that row\'s "contact". Set topic to that row\'s exact "topic" string.',
+    'Always include in "reply" the correct limit (תקרה) and contact person from the matched CONTEXT row when you discuss that topic or confirm an expense.',
+    '',
+    'Response format (Hebrew only in "reply"):',
+    '- Always respond in Hebrew in the "reply" field.',
+    '- If log_expense is true, summarize clearly: [Amount] נרשם עבור [Topic], החזר משוער: [refund vs limit—show your calculation], איש קשר: [Contact]. Use a friendly tone and emojis where appropriate.',
+    '- For informational questions, answer only from CONTEXT.',
+    '- If you do not understand, set log_expense false and ask a short clarifying question in Hebrew.',
+    '',
+    'Output must be JSON only, matching the response schema. When log_expense is true, fill expense_description with a short Hebrew description suitable for a spreadsheet note.',
   ].join('\n');
 }
 
@@ -42,7 +65,8 @@ function responseSchema() {
     properties: {
       reply: {
         type: SchemaType.STRING,
-        description: 'User-facing message in Hebrew with emojis',
+        description:
+          'Hebrew only. For expenses: amount registered for topic, estimated refund, contact. Friendly tone with emojis.',
       },
       log_expense: {
         type: SchemaType.BOOLEAN,
@@ -52,9 +76,13 @@ function responseSchema() {
       topic: {
         type: SchemaType.STRING,
         nullable: true,
-        description: 'Topic string matching a row in kibbutz knowledge when possible',
+        description: 'Exact "topic" string from the matched CONTEXT row',
       },
-      submission_contact: { type: SchemaType.STRING, nullable: true },
+      submission_contact: {
+        type: SchemaType.STRING,
+        nullable: true,
+        description: 'Exact "contact" from the matched CONTEXT row',
+      },
       expense_description: { type: SchemaType.STRING, nullable: true },
       potential_refund: { type: SchemaType.NUMBER, nullable: true },
     },
@@ -79,10 +107,11 @@ function responseSchema() {
 async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
   const { hasMedia = false } = options;
   const modelName = (process.env.GEMINI_MODEL || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+  const contextJson = stringifyKibbutzContext();
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
     model: modelName,
-    systemInstruction: buildSystemInstruction(),
+    systemInstruction: buildSystemInstruction(contextJson),
     generationConfig: {
       temperature: 0.35,
       responseMimeType: 'application/json',
@@ -90,10 +119,10 @@ async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
     },
   });
 
-  const knowledge = JSON.stringify(kibbutzData, null, 0);
-  let prompt = `KIBBUTZ_KNOWLEDGE_JSON:\n${knowledge}\n\nUSER_MESSAGE:\n${userMessage || '(ריק)'}`;
+  let prompt = `USER_MESSAGE:\n${userMessage || '(ריק)'}`;
   if (hasMedia) {
-    prompt += '\n\n(המשתמש שלח גם קובץ מדיה/תמונה; אין לך גישה לתוכן התמונה — הסתמך רק על הטקסט למעלה.)';
+    prompt +=
+      '\n\n(המשתמש שלח גם קובץ מדיה/תמונה; אין לך גישה לתוכן התמונה — הסתמך רק על הטקסט למעלה וב־CONTEXT שבהוראות המערכת.)';
   }
 
   const result = await model.generateContent(prompt);
@@ -106,5 +135,6 @@ async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
 
 module.exports = {
   runGeminiKibbutzTurn,
+  stringifyKibbutzContext,
   DEFAULT_MODEL,
 };
