@@ -16,6 +16,7 @@ const axios = require('axios');
 const cron = require('node-cron');
 const twilio = require('twilio');
 const MessagingResponse = twilio.twiml.MessagingResponse;
+const kibbutzData = require('./kibbutzData');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -28,6 +29,25 @@ const DRIVE_UPLOAD_FAIL_USER_MSG =
   'העלאה לדרייב נכשלה.\n\nשלח שוב את הקבלה, או שמור אצלך עד שנסגר.\n\nאם זה נמשך — בדוק הרשאות Drive.';
 
 const MEDIA_PROCESSING_ACK_MSG = 'מעלה את הקובץ… רגע.';
+
+/** תשובות FAQ מ־kibbutzData: Markdown **bold** → *bold* ל-WhatsApp */
+function formatKibbutzKnowledgeAnswer(answer) {
+  return String(answer || '').replace(/\*\*/g, '*');
+}
+
+/** התאמה ראשונה לפי מילת מפתח (תת-מחרוזת ב-lower). */
+function matchKibbutzKnowledge(lower) {
+  for (const entry of kibbutzData) {
+    const keywords = entry.keywords || [];
+    for (const kw of keywords) {
+      const needle = String(kw).toLowerCase();
+      if (needle && lower.includes(needle)) {
+        return formatKibbutzKnowledgeAnswer(entry.answer);
+      }
+    }
+  }
+  return null;
+}
 
 function savvySummaryTotalLine(total) {
   return `*סה״כ מחכה לך:* *${formatShekelDisplay(total)}* ש״ח`;
@@ -2404,6 +2424,28 @@ app.post('/whatsapp', async (req, res) => {
       'אין כרגע משהו לאשר.\n\nשלח *סכום + תיאור* או *סיכום* לריכוז החודש.'
     );
     return;
+  }
+
+  // ─── ידע סטטי (kibbutzData): רק טקסט בלי רישום הוצאה, מצב IDLE ───
+  if (
+    session.state === 'IDLE' &&
+    !hasMedia &&
+    trimmed &&
+    !ib.btnPayload &&
+    !ib.categoryPayload
+  ) {
+    const expenseProbe = parseExpenseMessage(trimmed);
+    const looksLikeExpenseReport =
+      typeof expenseProbe.amount === 'number' &&
+      !Number.isNaN(expenseProbe.amount) &&
+      expenseProbe.amount > 0;
+    if (!looksLikeExpenseReport) {
+      const knowledgeReply = matchKibbutzKnowledge(lower);
+      if (knowledgeReply) {
+        sendTwiML(res, knowledgeReply);
+        return;
+      }
+    }
   }
 
   // ─── AWAITING_CATEGORY_CONFIRM (אחרי זיהוי אוטומטי) ───
