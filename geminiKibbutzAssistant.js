@@ -1,13 +1,10 @@
 /**
  * עוזר קיבוץ מבוסס Gemini — CONTEXT מ־kibbutzData בהוראות מערכת.
- * מפתח: המתקשר מעביר process.env.GEMINI_API_KEY (ראה index.js).
+ * מפתח: תמיד מ־process.env.GEMINI_API_KEY (לא מועבר מחרוזת ריקה מבחוץ).
  */
 
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
-
-/** מזהה מודל יחיד — ללא fallback למודלים אחרים */
-const MODEL_ID = 'gemini-1.5-flash';
 
 function buildSystemInstruction() {
   const contextLine = `CONTEXT: ${JSON.stringify(kibbutzData)}`;
@@ -69,21 +66,23 @@ function responseSchema() {
 }
 
 /**
- * @param {string} apiKey — use process.env.GEMINI_API_KEY from the host app
  * @param {string} userMessage
  * @param {{ hasMedia?: boolean }} [options]
  */
-async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
-  const key = String(apiKey || '').trim();
-  if (!key) {
-    throw new Error('gemini: GEMINI_API_KEY is missing');
+async function runGeminiKibbutzTurn(userMessage, options = {}) {
+  const { hasMedia = false } = options;
+  if (
+    process.env.GEMINI_API_KEY == null ||
+    typeof process.env.GEMINI_API_KEY !== 'string' ||
+    !process.env.GEMINI_API_KEY.trim()
+  ) {
+    throw new Error('gemini: GEMINI_API_KEY is missing or empty in process.env');
   }
 
-  const { hasMedia = false } = options;
-  const genAI = new GoogleGenerativeAI(key);
-
+  // Key from env at request time (.trim() avoids newline from secret managers → 403 unregistered caller)
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
   const model = genAI.getGenerativeModel({
-    model: MODEL_ID,
+    model: 'gemini-1.5-flash',
     systemInstruction: buildSystemInstruction(),
     generationConfig: {
       temperature: 0.35,
@@ -105,7 +104,12 @@ async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
   return parsed;
 }
 
+function isGeminiApiKeyConfigured() {
+  const v = process.env.GEMINI_API_KEY;
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
 module.exports = {
   runGeminiKibbutzTurn,
-  MODEL_ID,
+  isGeminiApiKeyConfigured,
 };

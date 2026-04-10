@@ -26,7 +26,7 @@ const {
   estimatedRefund,
   potentialRefundForAmountAndTopic,
 } = require('./kibbutzSmart');
-const { runGeminiKibbutzTurn } = require('./geminiKibbutzAssistant');
+const { runGeminiKibbutzTurn, isGeminiApiKeyConfigured } = require('./geminiKibbutzAssistant');
 const kibbutzData = require('./kibbutzData');
 
 const app = express();
@@ -86,8 +86,6 @@ const GOOGLE_SHEET_ID = (
 const GOOGLE_DRIVE_FOLDER_ID = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
 /** Public base URL (no trailing slash) so Twilio can fetch one-time chart PNGs from GET /__media/chart/:token */
 const PUBLIC_WEBHOOK_BASE = (process.env.PUBLIC_WEBHOOK_BASE || '').trim().replace(/\/$/, '');
-/** מפתח Google AI Studio / Gemini — חובה לשילוב Gemini */
-const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
@@ -2663,7 +2661,14 @@ function logConfigOnce() {
     '[config] PUBLIC_WEBHOOK_BASE:',
     PUBLIC_WEBHOOK_BASE || '(not set — monthly chart may use direct QuickChart URL only)'
   );
-  console.log('[config] GEMINI_API_KEY:', GEMINI_API_KEY ? '(set)' : '(not set — Gemini assistant disabled)');
+  const geminiEnv = process.env.GEMINI_API_KEY;
+  const geminiOk = typeof geminiEnv === 'string' && geminiEnv.trim().length > 0;
+  console.log('[config] GEMINI_API_KEY:', geminiOk ? '(set)' : '(not set — Gemini assistant disabled)');
+  console.log(
+    '[debug] GEMINI_API_KEY defined at startup:',
+    geminiOk,
+    geminiOk ? `(trimmed length ${geminiEnv.trim().length})` : '(set GEMINI_API_KEY in the host environment)'
+  );
 }
 logConfigOnce();
 
@@ -2791,7 +2796,7 @@ app.post('/whatsapp', async (req, res) => {
 
   // ─── ידע סטטי (kibbutzData): רק טקסט בלי רישום הוצאה, מצב IDLE (בלי Gemini) ───
   if (
-    !GEMINI_API_KEY &&
+    !isGeminiApiKeyConfigured() &&
     session.state === 'IDLE' &&
     !hasMedia &&
     trimmed &&
@@ -3828,7 +3833,7 @@ app.post('/whatsapp', async (req, res) => {
 
   // ─── Gemini: process.env.GEMINI_API_KEY — applyGeminiWhatsAppResult שולח את reply ב-sendTwiML (טקסט ל-WhatsApp); ברישום הוצאה נקרא saveFullRow / completeSmartExpenseFromKibbutzEntry לפני התשובה (חוץ מאישור סכום גבוה) ───
   if (
-    GEMINI_API_KEY &&
+    isGeminiApiKeyConfigured() &&
     session.state === 'IDLE' &&
     !hasMedia &&
     trimmed &&
@@ -3836,7 +3841,7 @@ app.post('/whatsapp', async (req, res) => {
     !ib.categoryPayload
   ) {
     try {
-      const geminiOut = await runGeminiKibbutzTurn(GEMINI_API_KEY, trimmed, { hasMedia: false });
+      const geminiOut = await runGeminiKibbutzTurn(trimmed, { hasMedia: false });
       await applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, geminiOut, trimmed);
     } catch (e) {
       console.error('[gemini]', e && e.message ? e.message : e);
