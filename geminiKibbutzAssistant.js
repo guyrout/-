@@ -1,6 +1,5 @@
 /**
- * Gemini — Google Generative Language API. תשובה טקסט בלבד.
- * ברירת מחדל: v1beta (תואם @google/generative-ai ורוב מפתחות AI Studio). ניתן לכפות v1 עם GEMINI_API_VERSION=v1.
+ * Gemini — ללא systemInstruction (תואם v1); כל ההקשר בפרומפט המשתמש.
  */
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -8,27 +7,10 @@ const kibbutzData = require('./kibbutzData');
 
 const MODEL_NAME = 'gemini-1.5-flash';
 
-/** v1beta נתמך היטב ע״י הספרייה; v1 לפי דרישה (מונע 404 אצל חלק מהמפתחות) */
 const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || 'v1beta').trim() || 'v1beta';
 
-function buildSystemInstruction() {
-  const contextJson = JSON.stringify(kibbutzData, null, 2);
-  return [
-    'You are a professional Kibbutz Assistant for refund questions and expense help.',
-    '',
-    '=== REFUND RULES (CONTEXT) — use ONLY this data ===',
-    contextJson,
-    '',
-    'Rules:',
-    '- Answer from CONTEXT only: topic, keywords, limit, contact, answer.',
-    '- For questions, use CONTEXT. If the topic is not there, say you do not have that information.',
-    '',
-    'Return your answer as a plain text string in Hebrew. If you detect an expense, include the amount and category clearly.',
-  ].join('\n');
-}
-
 /**
- * @returns {{ reply: string, log_expense: false }} — טקסט בלבד; אין פענוח JSON מהמודל (שמירה לגיליון תתבסס על נתיבים אחרים או פענוח ידני בעתיד).
+ * @returns {{ reply: string, log_expense: false }}
  */
 async function runGeminiKibbutzTurn(userMessage, options = {}) {
   const { hasMedia = false } = options;
@@ -41,17 +23,19 @@ async function runGeminiKibbutzTurn(userMessage, options = {}) {
   }
 
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
-  const model = genAI.getGenerativeModel(
-    {
-      model: MODEL_NAME,
-      systemInstruction: buildSystemInstruction(),
-    },
-    { apiVersion: GEMINI_API_VERSION }
-  );
+  const model = genAI.getGenerativeModel({ model: MODEL_NAME }, { apiVersion: GEMINI_API_VERSION });
 
-  let prompt = `USER_MESSAGE:\n${userMessage || '(ריק)'}`;
+  const q = userMessage || '(ריק)';
+  let prompt = `
+Here are the Kibbutz rules: ${JSON.stringify(kibbutzData)}
+
+User Question: ${q}
+
+Answer in Hebrew based ONLY on the rules above.
+`.trim();
+
   if (hasMedia) {
-    prompt += '\n\n(נשלחה גם מדיה — אין גישה לתוכן התמונה, רק הטקסט למעלה.)';
+    prompt += '\n\n(Note: the user also sent media; you only have this text, not the image.)';
   }
 
   const result = await model.generateContent(prompt);
