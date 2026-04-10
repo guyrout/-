@@ -2388,8 +2388,8 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
 }
 
 /**
- * מחזיר את טקסט Gemini למשתמש ב-sendTwiML (מקביל ל-sendText ב-WhatsApp דרך Twilio).
- * log_expense: שמירה ב-saveFullRow או completeSmartExpenseFromKibbutzEntry לפני שליחת התשובה; סכום גבוה — שמירה רק אחרי אישור המשתמש.
+ * מחזיר את טקסט Gemini ב-sendTwiML. כרגע המודל מחזיר טקסט בלבד (ללא JSON) — log_expense נשאר false;
+ * שמירת הוצאות מתבצעת בנתיבי parseExpenseMessage / kibbutzSmart מחוץ ל-Gemini, או בפענוח ידני בעתיד.
  */
 async function applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, g, userTrimmed) {
   const fallbackClarify =
