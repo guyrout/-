@@ -17,6 +17,12 @@ const cron = require('node-cron');
 const twilio = require('twilio');
 const MessagingResponse = twilio.twiml.MessagingResponse;
 const kibbutzData = require('./kibbutzData');
+const {
+  findKibbutzEntryForText,
+  extractSubmissionContacts,
+  findBreachedPolicyCap,
+  buildSmartLogReply,
+} = require('./kibbutzSmart');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -1165,7 +1171,15 @@ function parseInboundInteractive(req) {
 // ===================== Google Sheets =====================
 
 const SHEET_HEADERS_PREFERRED = [
-  'Date', 'Amount', 'Category', 'Drive_Link', 'Status', 'Notes', 'User',
+  'Date',
+  'Amount',
+  'Category',
+  'Topic',
+  'SubmissionContact',
+  'Drive_Link',
+  'Status',
+  'Notes',
+  'User',
 ];
 
 async function ensureHeaders(sheet) {
@@ -1220,7 +1234,7 @@ function getCol(row, col) {
   return (typeof row.get === 'function' ? row.get(col) : row[col]) || '';
 }
 
-async function appendExpenseRow(notes, amount, category, driveLink, userValue) {
+async function appendExpenseRow(notes, amount, category, driveLink, userValue, meta = {}) {
   const doc = await getSpreadsheetDoc();
   if (!doc) return null;
   const sheet = doc.sheetsByIndex[0];
@@ -1229,10 +1243,14 @@ async function appendExpenseRow(notes, amount, category, driveLink, userValue) {
   const headers = sheet.headerValues || [];
   const { date, time } = formatNow();
   const dl = (driveLink || '').trim();
+  const topic = (meta.topic != null ? meta.topic : category) || '';
+  const submissionContact = (meta.submissionContact || '').trim();
   const full = {
     Date: date,
     Amount: amount,
     Category: category,
+    Topic: topic,
+    SubmissionContact: submissionContact,
     Drive_Link: dl,
     Status: 'Pending',
     Notes: notes || '',
@@ -1453,6 +1471,8 @@ async function getRowsForMonth(targetYear, targetMonth, includeRaw, ownerWaNorm)
     const entry = {
       amt,
       cat: getCol(row, 'Category') || '',
+      topic: getCol(row, 'Topic') || '',
+      submissionContact: getCol(row, 'SubmissionContact') || '',
       desc: sheetNotes(row),
       receipt: rowHasReceiptAttachment(row) ? 'Yes' : 'No',
       submitted: sheetStatusIsRefunded(row) ? 'Yes' : 'No',
@@ -1613,6 +1633,64 @@ function savvyDeepInsightTopCategory(topCategory, topAmount, grandTotal) {
   return `הקטגוריה הבולטת: *${topCategory}* — כ-*${share}%* מסך ההחזרים החודש.`;
 }
 
+function buildSubmissionContactTotals(rows) {
+  const m = new Map();
+  for (const r of rows) {
+    const key = (r.submissionContact || '').trim() || 'ללא איש קשר להגשה';
+    m.set(key, (m.get(key) || 0) + r.amt);
+  }
+  return m;
+}
+
+function savvyDeepInsightTopContact(topLabel, topAmount, grandTotal) {
+  if (!topLabel || grandTotal <= 0) return '';
+  const share = Math.max(1, Math.round((topAmount / grandTotal) * 100));
+  return `רוב הסכום מרוכז אצל *${topLabel}* — *${share}%* מהחודש.`;
+}
+
+/** סיכום חודשי מקובץ לפי איש קשר להגשה (SubmissionContact) */
+function formatMonthlySummaryBySubmissionContact(monthName, rows, totalShekels, footnoteLines = []) {
+  const byContact = new Map();
+  for (const r of rows) {
+    const key = (r.submissionContact || '').trim() || 'ללא איש קשר להגשה';
+    if (!byContact.has(key)) byContact.set(key, []);
+    byContact.get(key).push(r);
+  }
+  const body = [];
+  body.push(`*ריכוז החזרים - ${monthName}*`);
+  body.push('');
+  body.push(UI_DIV);
+  body.push('');
+  if (!rows.length) {
+    body.push('אין רישומים החודש.');
+  } else {
+    const sortedKeys = [...byContact.keys()].sort((a, b) => {
+      const sumA = byContact.get(a).reduce((s, x) => s + x.amt, 0);
+      const sumB = byContact.get(b).reduce((s, x) => s + x.amt, 0);
+      return sumB - sumA;
+    });
+    for (const key of sortedKeys) {
+      const list = byContact.get(key);
+      body.push(`*להגשה מול ${key}:*`);
+      for (const r of list) {
+        const label = ((r.topic || r.cat || r.desc || '(ללא תיאור)') + '').trim();
+        body.push(`• ${label} — *${formatShekelDisplay(r.amt)}* ש״ח`);
+      }
+      body.push('');
+    }
+  }
+  body.push(UI_DIV);
+  body.push('');
+  body.push(`*סה״כ החזרים צפויים לחודש זה:* *${formatShekelDisplay(totalShekels)}* ש"ח`);
+  for (const line of footnoteLines) {
+    if (line) {
+      body.push('');
+      body.push(line);
+    }
+  }
+  return body.join('\n');
+}
+
 const QUICKCHART_BASE = 'https://quickchart.io/chart';
 
 /** פלטת פסטל לעד 11 פרוסות */
@@ -1623,6 +1701,10 @@ const MONTHLY_DOUGHNUT_PASTELS = [
 
 function summaryChartCaptionShekels(totalDisplay) {
   return `פילוח לפי קטגוריה · סה״כ *${totalDisplay}* ש״ח`;
+}
+
+function summaryChartCaptionContacts(totalDisplay) {
+  return `פילוח לפי איש קשר להגשה · סה״כ *${totalDisplay}* ש״ח`;
 }
 
 /** One-time PNG blobs for Twilio MediaUrl when PUBLIC_WEBHOOK_BASE is set */
@@ -1679,7 +1761,7 @@ function registerChartPngOneShotUrl(buffer) {
   return `${PUBLIC_WEBHOOK_BASE}/__media/chart/${token}`;
 }
 
-async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap, totalShekels) {
+async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap, totalShekels, captionOverride) {
   const map = categoryTotalsMap && typeof categoryTotalsMap.entries === 'function' ? categoryTotalsMap : new Map();
   const entries = [...map.entries()]
     .filter(([, amt]) => amt > 0)
@@ -1687,7 +1769,9 @@ async function sendMonthlySummaryChartToWhatsApp(waNorm, categoryTotalsMap, tota
   if (entries.length === 0) return;
 
   const chartJs = buildMonthlySummaryDoughnutChartJs(entries);
-  const caption = summaryChartCaptionShekels(formatShekelDisplay(totalShekels));
+  const caption =
+    captionOverride ||
+    summaryChartCaptionShekels(formatShekelDisplay(totalShekels));
 
   try {
     const png = await fetchQuickChartPngBuffer(chartJs);
@@ -1756,23 +1840,31 @@ async function buildVisualSummaryPackage(ownerWaNorm) {
   const prevTotal = sumCategoryTotalsMap(agg.prevByCategory);
   const comparison = formatMoMTotalInsight(curTotal, prevTotal, agg.prevMonthName);
 
-  const totalsMap = agg.curByCategory || new Map();
+  const contactTotalsMap = buildSubmissionContactTotals(agg.curRows);
 
   if (agg.curRows.length === 0 || curTotal <= 0) {
     return {
-      firstMessage: formatMonthlyDashboardBody(monthName, new Map(), 0, [comparison]),
+      firstMessage: formatMonthlySummaryBySubmissionContact(monthName, [], 0, [comparison]),
       chartUrl: null,
-      categoryTotals: totalsMap,
+      categoryTotals: contactTotalsMap,
+      chartCaption: summaryChartCaptionContacts(formatShekelDisplay(0)),
     };
   }
 
-  const sorted = [...totalsMap.entries()].sort((a, b) => b[1] - a[1]);
-  const [topCat, topAmt] = sorted[0];
-  const deep = savvyDeepInsightTopCategory(topCat, topAmt, curTotal);
+  const sortedC = [...contactTotalsMap.entries()].sort((a, b) => b[1] - a[1]);
+  const [topContact, topCAmt] = sortedC[0] || ['', 0];
+  const deep = savvyDeepInsightTopContact(topContact, topCAmt, curTotal);
 
-  const firstMessage = formatMonthlyDashboardBody(monthName, totalsMap, curTotal, [comparison, deep]);
+  const firstMessage = formatMonthlySummaryBySubmissionContact(monthName, agg.curRows, curTotal, [
+    comparison,
+    deep,
+  ]);
 
-  return { firstMessage, categoryTotals: totalsMap };
+  return {
+    firstMessage,
+    categoryTotals: contactTotalsMap,
+    chartCaption: summaryChartCaptionContacts(formatShekelDisplay(curTotal)),
+  };
 }
 
 async function sendVisualMonthlySummary(res, waNorm) {
@@ -1784,7 +1876,7 @@ async function sendVisualMonthlySummary(res, waNorm) {
   sendTwiML(res, pkg.firstMessage);
   const totalsMap = pkg.categoryTotals && typeof pkg.categoryTotals.entries === 'function' ? pkg.categoryTotals : new Map();
   const chartTotal = sumCategoryTotalsMap(totalsMap);
-  await sendMonthlySummaryChartToWhatsApp(waNorm, totalsMap, chartTotal);
+  await sendMonthlySummaryChartToWhatsApp(waNorm, totalsMap, chartTotal, pkg.chartCaption);
 }
 
 const SUMMARY_FOOTERS = [
@@ -1799,56 +1891,34 @@ async function buildMonthlySummary(ownerWaNorm) {
   const { rows, curMonth } = data;
   const monthName = HEB_MONTHS[curMonth];
 
-  if (rows.length === 0) {
-    return `*ריכוז החזרים - ${monthName}*\n\nאין עדיין רישומים החודש.\n\nשלח *סכום + תיאור* כדי להתחיל.`;
-  }
-
-  const categoryTotals = new Map();
-  const categoryItems = new Map();
-  let noReceipt = 0, notSubmitted = 0;
-
+  let noReceipt = 0;
+  let notSubmitted = 0;
   for (const r of rows) {
-    categoryTotals.set(r.cat, (categoryTotals.get(r.cat) || 0) + r.amt);
-    if (!categoryItems.has(r.cat)) categoryItems.set(r.cat, []);
-    categoryItems.get(r.cat).push({ desc: r.desc, amt: r.amt, time: r.time });
     if (r.receipt !== 'Yes') noReceipt++;
     if (r.submitted !== 'Yes') notSubmitted++;
   }
 
-  let grandTotal = 0;
-  for (const [, t] of categoryTotals) grandTotal += t;
+  const grandTotal = rows.reduce((s, r) => s + r.amt, 0);
 
-  const lines = [];
-  lines.push(savvySummaryTotalLine(grandTotal));
-  lines.push('');
-  lines.push(`*ריכוז החזרים - ${monthName}*`);
-  lines.push(UI_DIV);
-
-  for (const [cat, total] of [...categoryTotals.entries()].sort((a, b) => b[1] - a[1])) {
-    lines.push(`*${cat}* — *${formatShekelDisplay(total)}* ש״ח`);
-    const items = categoryItems.get(cat) || [];
-    if (items.length > 1) {
-      for (const it of items) {
-        const ts = it.time ? ` (${it.time})` : '';
-        lines.push(`      ${it.desc} — ${formatShekelDisplay(it.amt)} ש״ח${ts}`);
-      }
-    }
-  }
-
-  lines.push(UI_DIV);
-
+  const footnotes = [];
   try {
     const prev = await getPrevMonthData(ownerWaNorm);
-    const mom = momLine(categoryTotals, prev.totals, prev.monthName);
-    if (mom) { lines.push(''); lines.push(mom); }
+    const mom = momLine(buildCategoryTotals(rows), prev.totals, prev.monthName);
+    if (mom) footnotes.push(mom);
   } catch (_) {}
+  if (noReceipt > 0) footnotes.push(`*לתשומת לב:* ${noReceipt} רישומים בלי קבלה בדרייב.`);
+  if (notSubmitted > 0) {
+    footnotes.push(`*סטטוס:* ${notSubmitted} רישומים עדיין לא סומנו כהוגשו.`);
+  }
+  footnotes.push(SUMMARY_FOOTERS[Math.floor(Math.random() * SUMMARY_FOOTERS.length)]);
 
-  lines.push('');
-  if (noReceipt > 0) lines.push(`*לתשומת לב:* ${noReceipt} רישומים בלי קבלה בדרייב.`);
-  if (notSubmitted > 0) lines.push(`*סטטוס:* ${notSubmitted} רישומים עדיין לא סומנו כהוגשו.`);
-  lines.push('');
-  lines.push(SUMMARY_FOOTERS[Math.floor(Math.random() * SUMMARY_FOOTERS.length)]);
-  return lines.join('\n');
+  if (rows.length === 0) {
+    return (
+      `*ריכוז החזרים - ${monthName}*\n\nאין עדיין רישומים החודש.\n\nשלח *סכום + תיאור* כדי להתחיל.`
+    );
+  }
+
+  return formatMonthlySummaryBySubmissionContact(monthName, rows, grandTotal, footnotes);
 }
 
 async function buildMonthlyStats(ownerWaNorm) {
@@ -2117,8 +2187,15 @@ async function buildAndSendManagementList(res, phone, waNorm) {
   sendTwiMLMulti(res, chunks);
 }
 
-async function saveFullRow(phone, userSheetValue, amount, desc, category, driveLink) {
-  const row = await appendExpenseRow(desc, amount, category, (driveLink || '').trim(), userSheetValue);
+async function saveFullRow(phone, userSheetValue, amount, desc, category, driveLink, meta = {}) {
+  const row = await appendExpenseRow(
+    desc,
+    amount,
+    category,
+    (driveLink || '').trim(),
+    userSheetValue,
+    meta
+  );
   const rowIndex = row ? row.rowNumber : null;
   console.log(`[sheets] saved row ${rowIndex} for ${phone}`);
   const us = getUserState(phone);
@@ -2146,6 +2223,65 @@ async function beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick
   const fallback = `${line}\n\n*כן* / *לא*, או הכפתורים למטה.`;
   if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, fallback);
   else if (res && !res.headersSent) sendTwiML(res, fallback);
+}
+
+/** רישום מיידי לפי kibbutzData — דילוג על אישור קטגוריה */
+async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pick, lower, opts = {}) {
+  const useOutboundApi = !!opts.useOutboundApi;
+  const twimlAlreadyEmpty = !!opts.twimlAlreadyEmpty;
+  const desc = (pick.desc || '').trim();
+  const entry = findKibbutzEntryForText(desc.toLowerCase(), lower);
+  if (!entry) return false;
+
+  const amount = pick.amount;
+  const topic = entry.topic;
+  const contact = extractSubmissionContacts(entry.answer);
+  const capInfo = findBreachedPolicyCap(amount, entry.answer);
+  const capNote = capInfo ? capInfo.note : '';
+  const dupLine = await duplicateExpenseWarningLine(waNorm, amount, topic);
+  const receiptImage = (pick.receiptImage || '').trim();
+
+  if (amount > HIGH_AMOUNT_THRESHOLD) {
+    resetSession(phone);
+    const s = getSession(phone);
+    s.state = 'AWAITING_HIGH_CONFIRM';
+    s.pendingAmount = amount;
+    s.pendingDesc = desc;
+    s.pendingCategory = topic;
+    s.pendingDriveLink = receiptImage;
+    s.pendingKibbutzSmartAnswer = entry.answer;
+    s.ts = Date.now();
+    const msg = `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`;
+    if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, msg);
+    else if (res && !res.headersSent) sendTwiML(res, msg);
+    return true;
+  }
+
+  try {
+    const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, topic, receiptImage, {
+      topic,
+      submissionContact: contact,
+    });
+    resetSession(phone);
+    const reply = buildSmartLogReply(formatShekelDisplay(amount), topic, contact, capNote, dupLine);
+    if (receiptImage) {
+      if (!twimlAlreadyEmpty && res && !res.headersSent) emptyTwiMLResponse(res);
+      await sendReceiptSuccessQuickReply(waNorm, reply);
+      return true;
+    }
+    if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, reply);
+    else if (res && !res.headersSent) sendTwiML(res, reply);
+    const ns = getSession(phone);
+    ns.state = 'AWAITING_RECEIPT_IMAGE';
+    ns.receiptRowIndex = rowIdx;
+    ns.ts = Date.now();
+    return true;
+  } catch (e) {
+    console.error('[smart-kibbutz] append failed:', e.message);
+    if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, 'שגיאה בשמירה, נסה שוב');
+    else if (res && !res.headersSent) sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+    return true;
+  }
 }
 
 async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category) {
@@ -2918,6 +3054,16 @@ app.post('/whatsapp', async (req, res) => {
     const { amount, description } = parseExpenseMessage(trimmed);
     if (amount) {
       const desc = description || '(ללא תיאור)';
+      const pickEd = {
+        amount,
+        desc,
+        userSheetValue,
+        receipt: pendingDriveLink ? 'Yes' : 'No',
+        receiptImage: pendingDriveLink || '',
+      };
+      if (await tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pickEd, lower, {})) {
+        return;
+      }
       const category = matchCategory(desc);
       if (!category) {
         await startCategoryClarification(
@@ -2960,6 +3106,22 @@ app.post('/whatsapp', async (req, res) => {
         try {
           await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
           const driveLink = await handleMediaUpload(req, receiptFileBase);
+          const msgLower = `${String(trimmed || '').toLowerCase()} ${desc.toLowerCase()}`;
+          const pickSmartA = {
+            amount,
+            desc,
+            userSheetValue,
+            receipt: driveLink ? 'Yes' : 'No',
+            receiptImage: driveLink || '',
+          };
+          if (
+            await tryProceedSmartKibbutzExpense(null, phone, waNorm, userSheetValue, pickSmartA, msgLower, {
+              useOutboundApi: true,
+              twimlAlreadyEmpty: true,
+            })
+          ) {
+            return;
+          }
           const category = matchCategory(desc);
           if (!category) {
             await startCategoryClarification(
@@ -3141,6 +3303,16 @@ app.post('/whatsapp', async (req, res) => {
     const parsed = parseExpenseMessage(trimmed);
 
     if (parsed.amount && parsed.description) {
+      const pickD0 = {
+        amount: parsed.amount,
+        desc: parsed.description,
+        userSheetValue,
+        receipt: 'No',
+        receiptImage: '',
+      };
+      if (await tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pickD0, lower, {})) {
+        return;
+      }
       const category = matchCategory(parsed.description);
       if (!category) {
         await startCategoryClarification(
@@ -3170,6 +3342,16 @@ app.post('/whatsapp', async (req, res) => {
     }
 
     const desc = sanitizeDescription(trimmed) || '(ללא תיאור)';
+    const pickD0b = {
+      amount: pendingAmount,
+      desc,
+      userSheetValue,
+      receipt: 'No',
+      receiptImage: '',
+    };
+    if (await tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pickD0b, lower, {})) {
+      return;
+    }
     const category = matchCategory(desc);
     if (!category) {
       await startCategoryClarification(
@@ -3211,6 +3393,16 @@ app.post('/whatsapp', async (req, res) => {
     const parsed = parseExpenseMessage(trimmed);
     if (parsed.amount) {
       const { pendingDesc, pendingCategory } = s;
+      const pickAm0 = {
+        amount: parsed.amount,
+        desc: pendingDesc,
+        userSheetValue,
+        receipt: 'No',
+        receiptImage: '',
+      };
+      if (await tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pickAm0, lower, {})) {
+        return;
+      }
       const resolved = pendingCategory || matchCategory(pendingDesc);
       if (!resolved) {
         await startCategoryClarification(
@@ -3245,7 +3437,13 @@ app.post('/whatsapp', async (req, res) => {
 
   if (getSession(phone).state === 'AWAITING_HIGH_CONFIRM') {
     const s = getSession(phone);
-    const { pendingAmount, pendingDesc, pendingCategory, pendingDriveLink } = s;
+    const {
+      pendingAmount,
+      pendingDesc,
+      pendingCategory,
+      pendingDriveLink,
+      pendingKibbutzSmartAnswer,
+    } = s;
     if (matchesAny(lower, INTENT_CONFIRM_YES)) {
       if (!pendingCategory) {
         resetSession(phone);
@@ -3256,28 +3454,60 @@ app.post('/whatsapp', async (req, res) => {
       try {
         const hasImage = !!pendingDriveLink;
         const dupLine = await duplicateExpenseWarningLine(waNorm, pendingAmount, pendingCategory);
-        const rowIdx = await saveFullRow(
-          phone,
-          userSheetValue,
-          pendingAmount,
-          pendingDesc,
-          pendingCategory,
-          pendingDriveLink || ''
-        );
-        const { date } = formatNow();
-        const card = buildSuccessRecordCard(pendingAmount, pendingCategory, date, {
-          duplicateAppend: dupLine,
-          awaitingReceipt: !hasImage,
-        });
-        if (hasImage) {
-          emptyTwiMLResponse(res);
-          await sendReceiptSuccessQuickReply(waNorm, card);
+        if (pendingKibbutzSmartAnswer) {
+          const contact = extractSubmissionContacts(pendingKibbutzSmartAnswer);
+          const capInfo = findBreachedPolicyCap(pendingAmount, pendingKibbutzSmartAnswer);
+          const capNote = capInfo ? capInfo.note : '';
+          const rowIdx = await saveFullRow(
+            phone,
+            userSheetValue,
+            pendingAmount,
+            pendingDesc,
+            pendingCategory,
+            pendingDriveLink || '',
+            { topic: pendingCategory, submissionContact: contact }
+          );
+          const reply = buildSmartLogReply(
+            formatShekelDisplay(pendingAmount),
+            pendingCategory,
+            contact,
+            capNote,
+            dupLine
+          );
+          if (hasImage) {
+            emptyTwiMLResponse(res);
+            await sendReceiptSuccessQuickReply(waNorm, reply);
+          } else {
+            const ns = getSession(phone);
+            ns.state = 'AWAITING_RECEIPT_IMAGE';
+            ns.receiptRowIndex = rowIdx;
+            ns.ts = Date.now();
+            sendTwiML(res, reply);
+          }
         } else {
-          const ns = getSession(phone);
-          ns.state = 'AWAITING_RECEIPT_IMAGE';
-          ns.receiptRowIndex = rowIdx;
-          ns.ts = Date.now();
-          sendTwiML(res, card);
+          const rowIdx = await saveFullRow(
+            phone,
+            userSheetValue,
+            pendingAmount,
+            pendingDesc,
+            pendingCategory,
+            pendingDriveLink || ''
+          );
+          const { date } = formatNow();
+          const card = buildSuccessRecordCard(pendingAmount, pendingCategory, date, {
+            duplicateAppend: dupLine,
+            awaitingReceipt: !hasImage,
+          });
+          if (hasImage) {
+            emptyTwiMLResponse(res);
+            await sendReceiptSuccessQuickReply(waNorm, card);
+          } else {
+            const ns = getSession(phone);
+            ns.state = 'AWAITING_RECEIPT_IMAGE';
+            ns.receiptRowIndex = rowIdx;
+            ns.ts = Date.now();
+            sendTwiML(res, card);
+          }
         }
       } catch (e) {
         console.error('[sheets] append failed:', e.message);
@@ -3333,6 +3563,16 @@ app.post('/whatsapp', async (req, res) => {
   const { amount, description } = parseExpenseMessage(trimmed);
 
   if (amount && description) {
+    const pickSmartC = {
+      amount,
+      desc: description,
+      userSheetValue,
+      receipt: 'No',
+      receiptImage: '',
+    };
+    if (await tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue, pickSmartC, lower, {})) {
+      return;
+    }
     const category = matchCategory(description);
     if (!category) {
       await startCategoryClarification(
@@ -3496,6 +3736,13 @@ const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
 function runLocalUnitChecks() {
   console.log('\n=== [smoke] Unit tests ===');
   const t = (label, ok) => console.log(`  ${label}: ${ok ? '✓' : '✗'}`);
+  const ks = require('./kibbutzSmart');
+  const hairEntry = ks.findKibbutzEntryForText('תספורת', '400 תספורת');
+  t('kibbutz smart topic תספורת', hairEntry?.topic === 'תספורת וקוסמטיקה');
+  t(
+    'kibbutz smart cap breach',
+    !!ks.findBreachedPolicyCap(400, hairEntry?.answer || '')
+  );
   const a = parseExpenseMessage('150 דלק');
   t('parse "150 דלק"', a.amount === 150 && a.description === 'דלק');
   const b = parseExpenseMessage('הוצאתי 50 שקל על דלק');
