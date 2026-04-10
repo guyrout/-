@@ -29,7 +29,6 @@ const {
 const {
   runGeminiKibbutzTurn,
   isGeminiApiKeyConfigured,
-  getGeminiUserFacingError,
   GEMINI_API_VERSION,
   MODEL_NAME: GEMINI_MODEL_NAME,
 } = require('./geminiKibbutzAssistant');
@@ -42,10 +41,10 @@ app.use(express.urlencoded({ extended: false }));
 
 const UI_DIV = '──────────────';
 
-const DRIVE_UPLOAD_FAIL_USER_MSG =
-  'העלאה לדרייב נכשלה.\n\nשלח שוב את הקבלה, או שמור אצלך עד שנסגר.\n\nאם זה נמשך — בדוק הרשאות Drive.';
-
 const MEDIA_PROCESSING_ACK_MSG = 'מעלה את הקובץ… רגע.';
+
+/** הודעה אחידה לכל כשל ב-Gemini / Drive / Sheets (דרישת יציבות) */
+const USER_FACING_TECH_ERROR_HE = 'סליחה, יש לי תקלה טכנית כרגע';
 
 /** תשובות FAQ מ־kibbutzData: Markdown **bold** → *bold* ל-WhatsApp */
 function formatKibbutzKnowledgeAnswer(answer) {
@@ -208,6 +207,22 @@ function isValidServiceAccountJson(obj) {
   );
 }
 
+/** מפתחות מ-env (Heroku וכו׳) מגיעים לעיתים עם \\n במקום שורות אמיתיות */
+function normalizeGooglePrivateKey(pem) {
+  if (typeof pem !== 'string') return pem;
+  return pem.replace(/\\n/g, '\n');
+}
+
+/** מיזוג אופציונלי של GOOGLE_PRIVATE_KEY מעל ה-JSON */
+function finalizeServiceAccountCredentials(j) {
+  if (!j || typeof j !== 'object') return j;
+  const envKey = (process.env.GOOGLE_PRIVATE_KEY || '').trim();
+  return {
+    ...j,
+    private_key: normalizeGooglePrivateKey(envKey || j.private_key),
+  };
+}
+
 function loadGoogleServiceAccountCreds() {
   const localPath = path.join(__dirname, 'Expense-Tracker-Bot.json');
   if (fs.existsSync(localPath)) {
@@ -215,7 +230,7 @@ function loadGoogleServiceAccountCreds() {
       const j = JSON.parse(fs.readFileSync(localPath, 'utf8'));
       if (isValidServiceAccountJson(j)) {
         serviceAccountLoadSource = 'Expense-Tracker-Bot.json (local file)';
-        return j;
+        return finalizeServiceAccountCredentials(j);
       }
       console.error('[config] local SA file: invalid (need client_email + private_key)');
     } catch (e) {
@@ -229,7 +244,7 @@ function loadGoogleServiceAccountCreds() {
       const j = JSON.parse(fs.readFileSync(gacPath, 'utf8'));
       if (isValidServiceAccountJson(j)) {
         serviceAccountLoadSource = 'GOOGLE_APPLICATION_CREDENTIALS (file path)';
-        return j;
+        return finalizeServiceAccountCredentials(j);
       }
       console.error('[config] GOOGLE_APPLICATION_CREDENTIALS: invalid JSON shape');
     } catch (e) {
@@ -243,7 +258,7 @@ function loadGoogleServiceAccountCreds() {
       const j = JSON.parse(raw);
       if (isValidServiceAccountJson(j)) {
         serviceAccountLoadSource = 'GOOGLE_SERVICE_ACCOUNT_JSON (env string)';
-        return j;
+        return finalizeServiceAccountCredentials(j);
       }
       console.error('[config] GOOGLE_SERVICE_ACCOUNT_JSON: invalid shape after parse');
     } catch (e) {
@@ -258,7 +273,7 @@ function loadGoogleServiceAccountCreds() {
       const j = JSON.parse(decoded);
       if (isValidServiceAccountJson(j)) {
         serviceAccountLoadSource = 'GOOGLE_SERVICE_ACCOUNT_JSON_BASE64';
-        return j;
+        return finalizeServiceAccountCredentials(j);
       }
       console.error('[config] BASE64 SA: invalid shape after decode');
     } catch (e) {
@@ -279,14 +294,19 @@ function getSpreadsheetDoc() {
   if (!GOOGLE_SHEET_ID || !serviceAccountCreds) return null;
   if (!sheetsClientPromise) {
     sheetsClientPromise = (async () => {
-      const auth = new JWT({
-        email: serviceAccountCreds.client_email,
-        key: serviceAccountCreds.private_key,
-        scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-      });
-      const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID, auth);
-      await doc.loadInfo();
-      return doc;
+      try {
+        const auth = new JWT({
+          email: serviceAccountCreds.client_email,
+          key: serviceAccountCreds.private_key,
+          scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+        });
+        const doc = new GoogleSpreadsheet(GOOGLE_SHEET_ID, auth);
+        await doc.loadInfo();
+        return doc;
+      } catch (e) {
+        console.error('[sheets] getSpreadsheetDoc:', e && e.message ? e.message : e);
+        throw e;
+      }
     })();
   }
   return sheetsClientPromise;
@@ -299,33 +319,43 @@ let driveClient = null;
 function getDriveClient() {
   if (driveClient) return driveClient;
   if (!serviceAccountCreds) return null;
-  const auth = new JWT({
-    email: serviceAccountCreds.client_email,
-    key: serviceAccountCreds.private_key,
-    scopes: ['https://www.googleapis.com/auth/drive'],
-  });
-  driveClient = google.drive({ version: 'v3', auth });
-  return driveClient;
+  try {
+    const auth = new JWT({
+      email: serviceAccountCreds.client_email,
+      key: serviceAccountCreds.private_key,
+      scopes: ['https://www.googleapis.com/auth/drive'],
+    });
+    driveClient = google.drive({ version: 'v3', auth });
+    return driveClient;
+  } catch (e) {
+    console.error('[drive] getDriveClient:', e && e.message ? e.message : e);
+    return null;
+  }
 }
 
 async function downloadTwilioMedia(mediaUrl) {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-    console.error('[media] Download failed: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN missing');
-    throw new Error('Twilio credentials not configured for media download');
+  try {
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+      console.error('[media] Download failed: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN missing');
+      throw new Error('Twilio credentials not configured for media download');
+    }
+    console.log('[media] Downloading media via axios (arraybuffer + Twilio Basic auth)...');
+    const resp = await axios.get(mediaUrl, {
+      responseType: 'arraybuffer',
+      maxContentLength: 25 * 1024 * 1024,
+      maxBodyLength: 25 * 1024 * 1024,
+      auth: {
+        username: TWILIO_ACCOUNT_SID,
+        password: TWILIO_AUTH_TOKEN,
+      },
+    });
+    const buffer = Buffer.from(resp.data);
+    console.log('[media] Download finished, bytes:', buffer.length);
+    return { buffer, contentType: resp.headers['content-type'] || 'image/jpeg' };
+  } catch (e) {
+    console.error('[media] downloadTwilioMedia:', e && e.message ? e.message : e);
+    throw e;
   }
-  console.log('[media] Downloading media via axios (arraybuffer + Twilio Basic auth)...');
-  const resp = await axios.get(mediaUrl, {
-    responseType: 'arraybuffer',
-    maxContentLength: 25 * 1024 * 1024,
-    maxBodyLength: 25 * 1024 * 1024,
-    auth: {
-      username: TWILIO_ACCOUNT_SID,
-      password: TWILIO_AUTH_TOKEN,
-    },
-  });
-  const buffer = Buffer.from(resp.data);
-  console.log('[media] Download finished, bytes:', buffer.length);
-  return { buffer, contentType: resp.headers['content-type'] || 'image/jpeg' };
 }
 
 function bufferToStream(buf) {
@@ -341,54 +371,47 @@ function bufferToStream(buf) {
  * @returns {{ link: string | null, userMessage: string | null }} userMessage בעברית כשההעלאה נכשלה
  */
 async function uploadToDrive(buffer, contentType, fileName) {
-  if (!serviceAccountCreds) {
-    const msg =
-      '*דרייב — לא הוגדר חשבון שירות Google.*\n\n' +
-      'הגדר אחד מהבאים בשרת: *GOOGLE_SERVICE_ACCOUNT_JSON* (מחרוזת JSON מלאה), ' +
-      '*GOOGLE_SERVICE_ACCOUNT_JSON_BASE64*, או נתיב קובץ ב-*GOOGLE_APPLICATION_CREDENTIALS*.';
-    console.error('[drive] no service account — check env');
-    return { link: null, userMessage: msg };
-  }
-  const drive = getDriveClient();
-  if (!drive) {
-    const msg =
-      '*דרייב — לא ניתן ליצור לקוח Drive.*\n\nבדוק שה-JSON כולל *client_email* ו-*private_key* תקינים.';
-    return { link: null, userMessage: msg };
-  }
-  const folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
-  if (!folderId) {
-    const msg =
-      '*דרייב — חסר GOOGLE_DRIVE_FOLDER_ID.*\n\n' +
-      'הוסף במשתני הסביבה את מזהה התיקייה (מקשר לתיקייה ב-Drive) ושתף את חשבון השירות כעורך בתיקייה.';
-    console.error('[drive] GOOGLE_DRIVE_FOLDER_ID not set');
-    return { link: null, userMessage: msg };
-  }
-
-  console.log('[drive] Drive upload started:', fileName, `(${buffer.length} bytes)`);
-  const fileMetadata = {
-    name: fileName,
-    parents: [folderId],
-  };
-
   try {
-    const createRes = await drive.files.create({
-      requestBody: fileMetadata,
-      media: { mimeType: contentType, body: bufferToStream(buffer) },
-      fields: 'id,webViewLink',
-    });
-    const id = createRes.data.id;
-    const webViewLink =
-      createRes.data.webViewLink || (id ? `https://drive.google.com/file/d/${id}/view` : null);
-    console.log('[drive] Drive upload finished: fileId=', id, 'webViewLink=', webViewLink ? '(set)' : '(missing)');
-    return { link: webViewLink || null, userMessage: null };
-  } catch (error) {
-    const api = error.response?.data?.error;
-    const detail = api?.message || error.message || 'unknown';
-    console.error('[drive] API error:', error.response?.data || error.message);
-    const msg =
-      `*העלאה לדרייב נכשלה.*\n\n${String(detail).slice(0, 280)}\n\n` +
-      'בדוק: חשבון השירות הוא *עורך* על התיקייה, ה-API של Drive מופעל, והמכסה לא חרגה.';
-    return { link: null, userMessage: msg };
+    if (!serviceAccountCreds) {
+      console.error('[drive] no service account — check env');
+      return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
+    }
+    const drive = getDriveClient();
+    if (!drive) {
+      return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
+    }
+    const folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+    if (!folderId) {
+      console.error('[drive] GOOGLE_DRIVE_FOLDER_ID not set');
+      return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
+    }
+
+    console.log('[drive] Drive upload started:', fileName, `(${buffer.length} bytes)`);
+    const fileMetadata = {
+      name: fileName,
+      parents: [folderId],
+    };
+
+    try {
+      const createRes = await drive.files.create({
+        requestBody: fileMetadata,
+        media: { mimeType: contentType, body: bufferToStream(buffer) },
+        fields: 'id,webViewLink',
+      });
+      const id = createRes.data.id;
+      const webViewLink =
+        createRes.data.webViewLink || (id ? `https://drive.google.com/file/d/${id}/view` : null);
+      console.log('[drive] Drive upload finished: fileId=', id, 'webViewLink=', webViewLink ? '(set)' : '(missing)');
+      return { link: webViewLink || null, userMessage: null };
+    } catch (error) {
+      const api = error.response?.data?.error;
+      const detail = api?.message || error.message || 'unknown';
+      console.error('[drive] API error:', error.response?.data || error.message, detail);
+      return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
+    }
+  } catch (e) {
+    console.error('[drive] uploadToDrive:', e && e.message ? e.message : e);
+    return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
   }
 }
 
@@ -405,7 +428,7 @@ async function handleMediaUpload(req, fileBaseName) {
   if (!mediaUrl) {
     return {
       link: null,
-      userMessage: '*קבלה — לא התקבל קישור למדיה מ-WhatsApp.* נסה לשלוח את התמונה שוב.',
+      userMessage: USER_FACING_TECH_ERROR_HE,
     };
   }
 
@@ -423,17 +446,13 @@ async function handleMediaUpload(req, fileBaseName) {
     const fileName = `${safeBase}_${dd}_${mm}.${ext}`;
     const up = await uploadToDrive(buffer, contentType, fileName);
     if (!up.link) {
-      return { link: null, userMessage: up.userMessage || DRIVE_UPLOAD_FAIL_USER_MSG };
+      return { link: null, userMessage: up.userMessage || USER_FACING_TECH_ERROR_HE };
     }
     return { link: up.link, userMessage: null };
   } catch (e) {
     const errDetail = e.response?.data ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
     console.error('[media] Download/upload failed:', errDetail);
-    const msg =
-      e.message && /Twilio credentials/i.test(e.message)
-        ? '*לא ניתן להוריד את הקובץ מ-WhatsApp:* חסרים TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN בשרת.'
-        : `*לא ניתן להוריד את הקובץ מהודעה:* ${String(e.message || 'שגיאה').slice(0, 200)}`;
-    return { link: null, userMessage: msg };
+    return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
   }
 }
 
@@ -1350,43 +1369,48 @@ function getCol(row, col) {
 }
 
 async function appendExpenseRow(notes, amount, category, driveLink, userValue, meta = {}) {
-  const doc = await getSpreadsheetDoc();
-  if (!doc) return null;
-  const sheet = doc.sheetsByIndex[0];
-  await ensureHeaders(sheet);
-  await sheet.loadHeaderRow(1);
-  const headers = sheet.headerValues || [];
-  const { date, time } = formatNow();
-  const dl = (driveLink || '').trim();
-  const topic = (meta.topic != null ? meta.topic : category) || '';
-  const submissionContact = (meta.submissionContact || '').trim();
-  const full = {
-    Date: date,
-    Amount: amount,
-    Category: category,
-    Topic: topic,
-    SubmissionContact: submissionContact,
-    Drive_Link: dl,
-    Status: 'Pending',
-    Notes: notes || '',
-    User: userValue || '',
-    Description: notes || '',
-    Receipt: dl ? 'Yes' : 'No',
-    Submitted: 'No',
-    Time: time,
-    ReceiptImage: dl,
-  };
-  const rowObj = {};
-  for (const [k, v] of Object.entries(full)) {
-    if (headers.includes(k)) rowObj[k] = v;
+  try {
+    const doc = await getSpreadsheetDoc();
+    if (!doc) return null;
+    const sheet = doc.sheetsByIndex[0];
+    await ensureHeaders(sheet);
+    await sheet.loadHeaderRow(1);
+    const headers = sheet.headerValues || [];
+    const { date, time } = formatNow();
+    const dl = (driveLink || '').trim();
+    const topic = (meta.topic != null ? meta.topic : category) || '';
+    const submissionContact = (meta.submissionContact || '').trim();
+    const full = {
+      Date: date,
+      Amount: amount,
+      Category: category,
+      Topic: topic,
+      SubmissionContact: submissionContact,
+      Drive_Link: dl,
+      Status: 'Pending',
+      Notes: notes || '',
+      User: userValue || '',
+      Description: notes || '',
+      Receipt: dl ? 'Yes' : 'No',
+      Submitted: 'No',
+      Time: time,
+      ReceiptImage: dl,
+    };
+    const rowObj = {};
+    for (const [k, v] of Object.entries(full)) {
+      if (headers.includes(k)) rowObj[k] = v;
+    }
+    if (Object.keys(rowObj).length === 0) {
+      console.error('[sheets] אין כותרות תואמות בשורה 1 — בדוק את הגיליון');
+      return null;
+    }
+    const row = await sheet.addRow(rowObj);
+    console.log('[sheets] Sheet row added:', row ? `rowNumber=${row.rowNumber}` : '(null)');
+    return row;
+  } catch (e) {
+    console.error('[sheets] appendExpenseRow:', e && e.message ? e.message : e);
+    throw e;
   }
-  if (Object.keys(rowObj).length === 0) {
-    console.error('[sheets] אין כותרות תואמות בשורה 1 — בדוק את הגיליון');
-    return null;
-  }
-  const row = await sheet.addRow(rowObj);
-  console.log('[sheets] Sheet row added:', row ? `rowNumber=${row.rowNumber}` : '(null)');
-  return row;
 }
 
 async function hasDuplicateExpenseSameDay(ownerWaNorm, dateStr, amount, category) {
@@ -1991,15 +2015,21 @@ async function buildVisualSummaryPackage(ownerWaNorm) {
 }
 
 async function sendVisualMonthlySummary(res, waNorm) {
-  const pkg = await buildVisualSummaryPackage(waNorm);
-  if (!pkg) {
-    sendTwiML(res, 'אופס, לא הצלחתי לקרוא את השיטס. נסה שוב?');
-    return;
+  try {
+    const pkg = await buildVisualSummaryPackage(waNorm);
+    if (!pkg) {
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+      return;
+    }
+    sendTwiML(res, pkg.firstMessage);
+    const totalsMap =
+      pkg.categoryTotals && typeof pkg.categoryTotals.entries === 'function' ? pkg.categoryTotals : new Map();
+    const chartTotal = sumCategoryTotalsMap(totalsMap);
+    await sendMonthlySummaryChartToWhatsApp(waNorm, totalsMap, chartTotal, pkg.chartCaption);
+  } catch (e) {
+    console.error('[sheets] sendVisualMonthlySummary:', e && e.message ? e.message : e);
+    if (res && !res.headersSent) sendTwiML(res, USER_FACING_TECH_ERROR_HE);
   }
-  sendTwiML(res, pkg.firstMessage);
-  const totalsMap = pkg.categoryTotals && typeof pkg.categoryTotals.entries === 'function' ? pkg.categoryTotals : new Map();
-  const chartTotal = sumCategoryTotalsMap(totalsMap);
-  await sendMonthlySummaryChartToWhatsApp(waNorm, totalsMap, chartTotal, pkg.chartCaption);
 }
 
 const SUMMARY_FOOTERS = [
@@ -2404,41 +2434,41 @@ async function startKibbutzDisambiguation(
 async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userSheetValue, pick, entry, opts = {}) {
   const useOutboundApi = !!opts.useOutboundApi;
   const twimlAlreadyEmpty = !!opts.twimlAlreadyEmpty;
-  const amount = pick.amount;
-  const desc = (pick.desc || '').trim();
-  const topic = entry.topic;
-  const contact =
-    (entry.contact && String(entry.contact).trim()) || extractSubmissionContacts(entry.answer || '');
-  const lim = Number(entry.limit);
-  const refund = estimatedRefund(amount, lim);
-  const refundDisp = formatShekelDisplay(refund);
-  const limitDisp = Number.isFinite(lim) && lim > 0 ? formatShekelDisplay(lim) : '—';
-  const capNote = capNoteFromEntry(amount, entry);
-  const dupLine = await duplicateExpenseWarningLine(waNorm, amount, topic);
-  const receiptImage = (pick.receiptImage || '').trim();
-
-  if (amount > HIGH_AMOUNT_THRESHOLD) {
-    resetSession(phone);
-    const s = getSession(phone);
-    s.state = 'AWAITING_HIGH_CONFIRM';
-    s.pendingAmount = amount;
-    s.pendingDesc = desc;
-    s.pendingCategory = topic;
-    s.pendingDriveLink = receiptImage;
-    s.pendingKibbutzSmartSnapshot = JSON.stringify({
-      topic: entry.topic,
-      limit: entry.limit,
-      contact,
-      answer: entry.answer || '',
-    });
-    s.ts = Date.now();
-    const msg = `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`;
-    if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, msg);
-    else if (res && !res.headersSent) sendTwiML(res, msg);
-    return true;
-  }
-
   try {
+    const amount = pick.amount;
+    const desc = (pick.desc || '').trim();
+    const topic = entry.topic;
+    const contact =
+      (entry.contact && String(entry.contact).trim()) || extractSubmissionContacts(entry.answer || '');
+    const lim = Number(entry.limit);
+    const refund = estimatedRefund(amount, lim);
+    const refundDisp = formatShekelDisplay(refund);
+    const limitDisp = Number.isFinite(lim) && lim > 0 ? formatShekelDisplay(lim) : '—';
+    const capNote = capNoteFromEntry(amount, entry);
+    const dupLine = await duplicateExpenseWarningLine(waNorm, amount, topic);
+    const receiptImage = (pick.receiptImage || '').trim();
+
+    if (amount > HIGH_AMOUNT_THRESHOLD) {
+      resetSession(phone);
+      const s = getSession(phone);
+      s.state = 'AWAITING_HIGH_CONFIRM';
+      s.pendingAmount = amount;
+      s.pendingDesc = desc;
+      s.pendingCategory = topic;
+      s.pendingDriveLink = receiptImage;
+      s.pendingKibbutzSmartSnapshot = JSON.stringify({
+        topic: entry.topic,
+        limit: entry.limit,
+        contact,
+        answer: entry.answer || '',
+      });
+      s.ts = Date.now();
+      const msg = `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`;
+      if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, msg);
+      else if (res && !res.headersSent) sendTwiML(res, msg);
+      return true;
+    }
+
     const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, topic, receiptImage, {
       topic,
       submissionContact: contact,
@@ -2473,9 +2503,9 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
     ns.ts = Date.now();
     return true;
   } catch (e) {
-    console.error('[smart-kibbutz] append failed:', e.message);
-    if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, 'שגיאה בשמירה, נסה שוב');
-    else if (res && !res.headersSent) sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+    console.error('[smart-kibbutz] completeSmartExpenseFromKibbutzEntry:', e && e.message ? e.message : e);
+    if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
+    else if (res && !res.headersSent) sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     return true;
   }
 }
@@ -2485,92 +2515,97 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
  * שמירת הוצאות מתבצעת בנתיבי parseExpenseMessage / kibbutzSmart מחוץ ל-Gemini, או בפענוח ידני בעתיד.
  */
 async function applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, g, userTrimmed) {
-  const fallbackClarify =
-    'הממ… לא הבנתי לגמרי 😅 תוכל לכתוב שוב בקצרה? (סכום + על מה, או שאלה על החזר)';
-  const replySafe =
-    g && typeof g.reply === 'string' && g.reply.trim() ? g.reply.trim() : fallbackClarify;
-
-  if (!g || !g.log_expense) {
-    sendTwiML(res, replySafe);
-    return;
-  }
-
-  const amount = Number(g.amount);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    sendTwiML(res, replySafe);
-    return;
-  }
-
-  const desc = (g.expense_description || userTrimmed || '').trim() || '(ללא תיאור)';
-  const hayLower = `${desc} ${userTrimmed}`.toLowerCase();
-  const matches = findKibbutzMatches(desc.toLowerCase(), hayLower);
-
-  let entry = null;
-  if (g.topic && String(g.topic).trim()) {
-    entry = kibbutzData.find((e) => e.topic === String(g.topic).trim()) || null;
-  }
-  if (!entry && matches.length === 1) entry = matches[0];
-  if (!entry && matches.length > 1) {
-    const pick = {
-      amount,
-      desc,
-      userSheetValue,
-      receipt: 'No',
-      receiptImage: '',
-    };
-    await startKibbutzDisambiguation(res, phone, waNorm, userSheetValue, pick, hayLower, matches, 'expense', {});
-    return;
-  }
-
-  if (entry) {
-    await completeSmartExpenseFromKibbutzEntry(
-      res,
-      phone,
-      waNorm,
-      userSheetValue,
-      { amount, desc, userSheetValue, receipt: 'No', receiptImage: '' },
-      entry,
-      { overrideReply: replySafe }
-    );
-    return;
-  }
-
-  const cat = matchCategory(desc) || (g.topic && String(g.topic).trim()) || 'שונות';
-  const contact = (g.submission_contact && String(g.submission_contact).trim()) || '';
-
-  const dupLine = await duplicateExpenseWarningLine(waNorm, amount, cat);
-
-  if (amount > HIGH_AMOUNT_THRESHOLD) {
-    resetSession(phone);
-    const s = getSession(phone);
-    s.state = 'AWAITING_HIGH_CONFIRM';
-    s.pendingAmount = amount;
-    s.pendingDesc = desc;
-    s.pendingCategory = cat;
-    s.pendingDriveLink = '';
-    s.pendingKibbutzSmartSnapshot = '';
-    s.ts = Date.now();
-    sendTwiML(
-      res,
-      `${replySafe}\n\n*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
-    );
-    return;
-  }
-
   try {
-    const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, cat, '', {
-      topic: (g.topic && String(g.topic).trim()) || cat,
-      submissionContact: contact,
-    });
-    resetSession(phone);
-    sendTwiML(res, `${replySafe}${dupLine}`);
-    const ns = getSession(phone);
-    ns.state = 'AWAITING_RECEIPT_IMAGE';
-    ns.receiptRowIndex = rowIdx;
-    ns.ts = Date.now();
+    const fallbackClarify =
+      'הממ… לא הבנתי לגמרי 😅 תוכל לכתוב שוב בקצרה? (סכום + על מה, או שאלה על החזר)';
+    const replySafe =
+      g && typeof g.reply === 'string' && g.reply.trim() ? g.reply.trim() : fallbackClarify;
+
+    if (!g || !g.log_expense) {
+      sendTwiML(res, replySafe);
+      return;
+    }
+
+    const amount = Number(g.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      sendTwiML(res, replySafe);
+      return;
+    }
+
+    const desc = (g.expense_description || userTrimmed || '').trim() || '(ללא תיאור)';
+    const hayLower = `${desc} ${userTrimmed}`.toLowerCase();
+    const matches = findKibbutzMatches(desc.toLowerCase(), hayLower);
+
+    let entry = null;
+    if (g.topic && String(g.topic).trim()) {
+      entry = kibbutzData.find((e) => e.topic === String(g.topic).trim()) || null;
+    }
+    if (!entry && matches.length === 1) entry = matches[0];
+    if (!entry && matches.length > 1) {
+      const pick = {
+        amount,
+        desc,
+        userSheetValue,
+        receipt: 'No',
+        receiptImage: '',
+      };
+      await startKibbutzDisambiguation(res, phone, waNorm, userSheetValue, pick, hayLower, matches, 'expense', {});
+      return;
+    }
+
+    if (entry) {
+      await completeSmartExpenseFromKibbutzEntry(
+        res,
+        phone,
+        waNorm,
+        userSheetValue,
+        { amount, desc, userSheetValue, receipt: 'No', receiptImage: '' },
+        entry,
+        { overrideReply: replySafe }
+      );
+      return;
+    }
+
+    const cat = matchCategory(desc) || (g.topic && String(g.topic).trim()) || 'שונות';
+    const contact = (g.submission_contact && String(g.submission_contact).trim()) || '';
+
+    const dupLine = await duplicateExpenseWarningLine(waNorm, amount, cat);
+
+    if (amount > HIGH_AMOUNT_THRESHOLD) {
+      resetSession(phone);
+      const s = getSession(phone);
+      s.state = 'AWAITING_HIGH_CONFIRM';
+      s.pendingAmount = amount;
+      s.pendingDesc = desc;
+      s.pendingCategory = cat;
+      s.pendingDriveLink = '';
+      s.pendingKibbutzSmartSnapshot = '';
+      s.ts = Date.now();
+      sendTwiML(
+        res,
+        `${replySafe}\n\n*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
+      );
+      return;
+    }
+
+    try {
+      const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, cat, '', {
+        topic: (g.topic && String(g.topic).trim()) || cat,
+        submissionContact: contact,
+      });
+      resetSession(phone);
+      sendTwiML(res, `${replySafe}${dupLine}`);
+      const ns = getSession(phone);
+      ns.state = 'AWAITING_RECEIPT_IMAGE';
+      ns.receiptRowIndex = rowIdx;
+      ns.ts = Date.now();
+    } catch (e) {
+      console.error('[gemini] save failed:', e.message);
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+    }
   } catch (e) {
-    console.error('[gemini] save failed:', e.message);
-    sendTwiML(res, 'אופס, משהו נתקע בשמירה 🙏 נסה שוב בעוד רגע?');
+    console.error('[gemini] applyGeminiWhatsAppResult:', e && e.message ? e.message : e);
+    if (res && !res.headersSent) sendTwiML(res, USER_FACING_TECH_ERROR_HE);
   }
 }
 
@@ -2617,48 +2652,53 @@ async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue,
 }
 
 async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category) {
-  const amount = pick.amount;
-  const desc = pick.desc;
-  const receiptImage = (pick.receiptImage || '').trim();
-  const dupLine = await duplicateExpenseWarningLine(waNorm, amount, category);
-
-  if (amount > HIGH_AMOUNT_THRESHOLD) {
-    resetSession(phone);
-    const s = getSession(phone);
-    s.state = 'AWAITING_HIGH_CONFIRM';
-    s.pendingAmount = amount;
-    s.pendingDesc = desc;
-    s.pendingCategory = category;
-    s.pendingDriveLink = receiptImage;
-    s.ts = Date.now();
-    sendTwiML(
-      res,
-      `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
-    );
-    return;
-  }
-
   try {
-    const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receiptImage);
-    const { date } = formatNow();
-    const card = buildSuccessRecordCard(amount, category, date, {
-      duplicateAppend: dupLine,
-      awaitingReceipt: !receiptImage,
-    });
-    resetSession(phone);
-    if (receiptImage) {
-      emptyTwiMLResponse(res);
-      await sendReceiptSuccessQuickReply(waNorm, card);
+    const amount = pick.amount;
+    const desc = pick.desc;
+    const receiptImage = (pick.receiptImage || '').trim();
+    const dupLine = await duplicateExpenseWarningLine(waNorm, amount, category);
+
+    if (amount > HIGH_AMOUNT_THRESHOLD) {
+      resetSession(phone);
+      const s = getSession(phone);
+      s.state = 'AWAITING_HIGH_CONFIRM';
+      s.pendingAmount = amount;
+      s.pendingDesc = desc;
+      s.pendingCategory = category;
+      s.pendingDriveLink = receiptImage;
+      s.ts = Date.now();
+      sendTwiML(
+        res,
+        `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
+      );
       return;
     }
-    sendTwiML(res, card);
-    const ns = getSession(phone);
-    ns.state = 'AWAITING_RECEIPT_IMAGE';
-    ns.receiptRowIndex = rowIdx;
-    ns.ts = Date.now();
+
+    try {
+      const rowIdx = await saveFullRow(phone, userSheetValue, amount, desc, category, receiptImage);
+      const { date } = formatNow();
+      const card = buildSuccessRecordCard(amount, category, date, {
+        duplicateAppend: dupLine,
+        awaitingReceipt: !receiptImage,
+      });
+      resetSession(phone);
+      if (receiptImage) {
+        emptyTwiMLResponse(res);
+        await sendReceiptSuccessQuickReply(waNorm, card);
+        return;
+      }
+      sendTwiML(res, card);
+      const ns = getSession(phone);
+      ns.state = 'AWAITING_RECEIPT_IMAGE';
+      ns.receiptRowIndex = rowIdx;
+      ns.ts = Date.now();
+    } catch (e) {
+      console.error('[sheets] append failed:', e.message);
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+    }
   } catch (e) {
-    console.error('[sheets] append failed:', e.message);
-    sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+    console.error('[sheets] proceedAfterCategoryConfirmed:', e && e.message ? e.message : e);
+    if (res && !res.headersSent) sendTwiML(res, USER_FACING_TECH_ERROR_HE);
   }
 }
 
@@ -2803,8 +2843,7 @@ app.get('/__media/chart/:token', (req, res) => {
   res.send(rec.buffer);
 });
 
-app.post('/whatsapp', async (req, res) => {
-  try {
+async function handleWhatsAppMessage(req, res) {
   const ctx = buildWhatsAppContext(req);
   const bodyRaw = req.body.Body ?? '';
   const numMedia = parseInt(req.body.NumMedia || '0', 10);
@@ -2879,7 +2918,7 @@ app.post('/whatsapp', async (req, res) => {
       await sendVisualMonthlySummary(res, waNorm);
     } catch (e) {
       console.error('[whatsapp] summary (quick-reply):', e.message);
-      sendTwiML(res, 'אופס, לא הצלחתי למשוך את הסיכום. נסה שוב בעוד רגע?');
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3026,7 +3065,7 @@ app.post('/whatsapp', async (req, res) => {
         await buildAndSendManagementList(res, phone, waNorm);
       } catch (e) {
         console.error('[mgmt] list failed:', e.message);
-        sendTwiML(res, 'לא הצלחתי לטעון את הרשימה, נסה שוב.');
+        sendTwiML(res, USER_FACING_TECH_ERROR_HE);
       }
       return;
     }
@@ -3047,11 +3086,11 @@ app.post('/whatsapp', async (req, res) => {
             await refreshManagementEditSnapshot(phone, waNorm);
             session.state = 'MANAGEMENT_EDIT_MENU';
             touchMgmt();
-            const warn = !driveLink ? `\n\n${driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG}` : '';
+            const warn = !driveLink ? `\n\n${USER_FACING_TECH_ERROR_HE}` : '';
             await replyWhatsAppToUser(waNorm, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
           } catch (e) {
             console.error('[whatsapp] mgmt receipt upload:', e.message);
-            await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+            await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
           }
         })();
         return;
@@ -3136,7 +3175,7 @@ app.post('/whatsapp', async (req, res) => {
             await updateRowDriveAndLegacy(rowNum, waNorm, finalImg || '');
             await refreshManagementEditSnapshot(phone, waNorm);
             touchMgmt();
-            const failMsg = driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG;
+            const failMsg = USER_FACING_TECH_ERROR_HE;
             const warn =
               !driveLink && !oldLink
                 ? `\n\n${failMsg}`
@@ -3146,7 +3185,7 @@ app.post('/whatsapp', async (req, res) => {
             await replyWhatsAppToUser(waNorm, `${MGMT_OK}${warn}\n\n${editMenuPrompt(us.managementEditRow)}`);
           } catch (e) {
             console.error('[whatsapp] mgmt menu receipt upload:', e.message);
-            await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+            await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
           }
         })();
         return;
@@ -3254,7 +3293,7 @@ app.post('/whatsapp', async (req, res) => {
       await buildAndSendManagementList(res, phone, waNorm);
     } catch (e) {
       console.error('[mgmt] list failed:', e.message);
-      sendTwiML(res, 'לא הצלחתי לטעון את הרשימה, נסה שוב.');
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3389,14 +3428,11 @@ app.post('/whatsapp', async (req, res) => {
               );
             }
           } else {
-            await replyWhatsAppToUser(
-              waNorm,
-              `${driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG}\n\n(הרישום נשמר בלי קובץ בדרייב. לביטול — *מחק*)`
-            );
+            await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
           }
         } catch (e) {
           console.error('[whatsapp] receipt image pipeline:', e.message);
-          await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+          await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
         }
       })();
       return;
@@ -3485,7 +3521,7 @@ app.post('/whatsapp', async (req, res) => {
           await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
           const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
           if (!driveLink && driveUserMsg) {
-            await replyWhatsAppToUser(waNorm, driveUserMsg);
+            await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
           }
           const msgLower = `${String(trimmed || '').toLowerCase()} ${desc.toLowerCase()}`;
           const pickSmartA = {
@@ -3533,7 +3569,7 @@ app.post('/whatsapp', async (req, res) => {
           });
         } catch (e) {
           console.error('[whatsapp] scenario A:', e.message);
-          await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+          await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
         }
       })();
       return;
@@ -3555,14 +3591,11 @@ app.post('/whatsapp', async (req, res) => {
             '*קבלה התקבלה*\n\nעל איזה החזר וכמה זה?\n\n(למשל *50 פנגו* / *120 מונית*)'
           );
         } else {
-          await replyWhatsAppToUser(
-            waNorm,
-            `${driveUserMsg || DRIVE_UPLOAD_FAIL_USER_MSG}\n\nשלח שוב *תמונת קבלה*, ואז *סכום + תיאור*.`
-          );
+          await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
         }
       } catch (e) {
         console.error('[whatsapp] scenario B:', e.message);
-        await replyWhatsAppToUser(waNorm, DRIVE_UPLOAD_FAIL_USER_MSG);
+        await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
       }
     })();
     return;
@@ -3580,7 +3613,7 @@ app.post('/whatsapp', async (req, res) => {
       await sendVisualMonthlySummary(res, waNorm);
     } catch (e) {
       console.error('[sheets] summary failed:', e.message);
-      sendTwiML(res, 'אופס, לא הצלחתי למשוך את הסיכום. נסה שוב בעוד רגע?');
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3591,7 +3624,7 @@ app.post('/whatsapp', async (req, res) => {
       sendTwiML(res, (await buildMonthlyStats(waNorm)) || 'אין עדיין מספיק רישומים לניתוח.');
     } catch (e) {
       console.error('[sheets] stats failed:', e.message);
-      sendTwiML(res, 'אופס, משהו נתקשה בניתוח. נסה שוב?');
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3617,7 +3650,7 @@ app.post('/whatsapp', async (req, res) => {
       }
     } catch (e) {
       console.error('[sheets] unsubmitted failed:', e.message);
-      sendTwiML(res, 'לא הצלחתי לשלוף נתונים, נסה שוב');
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3634,7 +3667,7 @@ app.post('/whatsapp', async (req, res) => {
       );
     } catch (e) {
       console.error('[sheets] mark submitted failed:', e.message);
-      sendTwiML(res, 'שגיאה בעדכון, נסה שוב');
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3653,7 +3686,8 @@ app.post('/whatsapp', async (req, res) => {
         sendTwiML(res, 'עדיין אין החזרים החודש. רשום אחד — אל תפספס כסף שמגיע לך 💰');
       }
     } catch (e) {
-      sendTwiML(res, 'לא הצלחתי לשלוף נתונים, נסה שוב');
+      console.error('[sheets] budget intent failed:', e && e.message ? e.message : e);
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -3918,7 +3952,7 @@ app.post('/whatsapp', async (req, res) => {
         }
       } catch (e) {
         console.error('[sheets] append failed:', e.message);
-        sendTwiML(res, 'שגיאה בשמירה, נסה שוב');
+        sendTwiML(res, USER_FACING_TECH_ERROR_HE);
       }
       return;
     }
@@ -3974,7 +4008,7 @@ app.post('/whatsapp', async (req, res) => {
       await applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, geminiOut, trimmed);
     } catch (e) {
       console.error('[gemini]', e && e.message ? e.message : e);
-      sendTwiML(res, getGeminiUserFacingError(e));
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
     return;
   }
@@ -4055,11 +4089,16 @@ app.post('/whatsapp', async (req, res) => {
     res,
     'לא הבנתי.\n\nשלח *סכום + תיאור* או *תמונת קבלה*.\n\n*שלום* — עזרה.'
   );
+}
+
+app.post('/whatsapp', async (req, res) => {
+  try {
+    await handleWhatsAppMessage(req, res);
   } catch (err) {
     console.error('[whatsapp] unhandled error:', err && err.stack ? err.stack : err);
     if (!res.headersSent) {
       try {
-        sendTwiML(res, 'מצטערים, נפלה שגיאה בשרת. נסה שוב בעוד רגע.');
+        sendTwiML(res, USER_FACING_TECH_ERROR_HE);
       } catch (_) { /* response already ended */ }
     }
   }
@@ -4102,7 +4141,7 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (error) {
     console.error(error);
-    sendTwiML(res, 'קרתה שגיאה, נסה שוב');
+    sendTwiML(res, USER_FACING_TECH_ERROR_HE);
   }
 });
 

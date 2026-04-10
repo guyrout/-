@@ -1,13 +1,11 @@
 /**
- * Gemini — ללא systemInstruction (תואם v1); כל ההקשר בפרומפט המשתמש.
+ * Gemini — ללא systemInstruction; kibbutzData בפרומפט טקסט בלבד; רק generateContent(prompt).
  */
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
 
 const MODEL_NAME = 'gemini-1.5-flash';
-
-const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || 'v1beta').trim() || 'v1beta';
 
 /**
  * @returns {{ reply: string, log_expense: false }}
@@ -22,11 +20,12 @@ async function runGeminiKibbutzTurn(userMessage, options = {}) {
     throw new Error('gemini: GEMINI_API_KEY is missing or empty in process.env');
   }
 
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
-  const model = genAI.getGenerativeModel({ model: MODEL_NAME }, { apiVersion: GEMINI_API_VERSION });
+  try {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
+    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
-  const q = userMessage || '(ריק)';
-  let prompt = `
+    const q = userMessage || '(ריק)';
+    let prompt = `
 Here are the Kibbutz rules: ${JSON.stringify(kibbutzData)}
 
 User Question: ${q}
@@ -34,28 +33,32 @@ User Question: ${q}
 Answer in Hebrew based ONLY on the rules above.
 `.trim();
 
-  if (hasMedia) {
-    prompt += '\n\n(Note: the user also sent media; you only have this text, not the image.)';
-  }
+    if (hasMedia) {
+      prompt += '\n\n(Note: the user also sent media; you only have this text, not the image.)';
+    }
 
-  const result = await model.generateContent(prompt);
-  let raw;
-  try {
-    raw = result.response.text();
+    const result = await model.generateContent(prompt);
+    let raw;
+    try {
+      raw = result.response.text();
+    } catch (e) {
+      const block = result.response?.promptFeedback?.blockReason;
+      const msg = block ? `blocked (${block})` : e && e.message ? e.message : String(e);
+      throw new Error(`gemini: no text in response — ${msg}`);
+    }
+    const reply = raw == null ? '' : String(raw).trim();
+    if (!reply) {
+      throw new Error('gemini: empty model output');
+    }
+
+    return {
+      reply,
+      log_expense: false,
+    };
   } catch (e) {
-    const block = result.response?.promptFeedback?.blockReason;
-    const msg = block ? `blocked (${block})` : e && e.message ? e.message : String(e);
-    throw new Error(`gemini: no text in response — ${msg}`);
+    console.error('[gemini]', e && e.message ? e.message : e);
+    throw e;
   }
-  const reply = raw == null ? '' : String(raw).trim();
-  if (!reply) {
-    throw new Error('gemini: empty model output');
-  }
-
-  return {
-    reply,
-    log_expense: false,
-  };
 }
 
 function isGeminiApiKeyConfigured() {
@@ -63,7 +66,7 @@ function isGeminiApiKeyConfigured() {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
-/** הודעת WhatsApp בעברית לפי שגיאת API */
+/** @deprecated — נשמר לתאימות; הנתיב הראשי משתמש ב-USER_FACING_TECH_ERROR_HE ב-index */
 function getGeminiUserFacingError(err) {
   const m = String(err && err.message != null ? err.message : err || '');
   if (/GEMINI_API_KEY|missing|empty in process\.env/i.test(m)) {
@@ -84,6 +87,8 @@ function getGeminiUserFacingError(err) {
   const short = m.replace(/\s+/g, ' ').trim().slice(0, 180);
   return `*שגיאה בחיבור לעוזר (Gemini)*\n\n${short || 'שגיאה לא ידועה'}\n\nנסה שוב או שלח *סכום + תיאור* בלי העוזר.`;
 }
+
+const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || 'v1beta').trim() || 'v1beta';
 
 module.exports = {
   runGeminiKibbutzTurn,
