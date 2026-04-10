@@ -5,7 +5,29 @@
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
 
-const DEFAULT_MODEL = 'gemini-1.5-flash';
+/** Prefer -latest; bare gemini-1.5-flash often 404s on current Google AI endpoints. Override with GEMINI_MODEL. */
+const DEFAULT_MODEL = 'gemini-1.5-flash-latest';
+
+/** Stable Flash on the live API when 1.5 aliases are retired (automatic retry on 404 only). */
+const FALLBACK_MODEL_ON_404 = 'gemini-2.5-flash';
+
+function isModelNotFoundError(err) {
+  if (!err) return false;
+  if (err.status === 404) return true;
+  return /404|\bnot found\b|is not found for API version/i.test(String(err.message || ''));
+}
+
+/**
+ * Current API: GenerativeModel.generateContent — do not use legacy predict/generateMessage paths.
+ */
+async function generateContentWithModel(genAI, modelId, systemInstruction, generationConfig, userPrompt) {
+  const model = genAI.getGenerativeModel({
+    model: modelId,
+    systemInstruction,
+    generationConfig,
+  });
+  return model.generateContent(userPrompt);
+}
 
 /** תוכן מלא של kibbutzData.js כמחרוזת JSON (מעוצב לקריאה במודל) */
 function stringifyKibbutzContext() {
@@ -106,18 +128,15 @@ function responseSchema() {
  */
 async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
   const { hasMedia = false } = options;
-  const modelName = (process.env.GEMINI_MODEL || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+  const preferredModel = (process.env.GEMINI_MODEL || DEFAULT_MODEL).trim() || DEFAULT_MODEL;
   const contextJson = stringifyKibbutzContext();
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    systemInstruction: buildSystemInstruction(contextJson),
-    generationConfig: {
-      temperature: 0.35,
-      responseMimeType: 'application/json',
-      responseSchema: responseSchema(),
-    },
-  });
+  const systemInstruction = buildSystemInstruction(contextJson);
+  const generationConfig = {
+    temperature: 0.35,
+    responseMimeType: 'application/json',
+    responseSchema: responseSchema(),
+  };
 
   let prompt = `USER_MESSAGE:\n${userMessage || '(ריק)'}`;
   if (hasMedia) {
@@ -125,7 +144,33 @@ async function runGeminiKibbutzTurn(apiKey, userMessage, options = {}) {
       '\n\n(המשתמש שלח גם קובץ מדיה/תמונה; אין לך גישה לתוכן התמונה — הסתמך רק על הטקסט למעלה וב־CONTEXT שבהוראות המערכת.)';
   }
 
-  const result = await model.generateContent(prompt);
+  let result;
+  try {
+    result = await generateContentWithModel(
+      genAI,
+      preferredModel,
+      systemInstruction,
+      generationConfig,
+      prompt
+    );
+  } catch (e) {
+    if (
+      !isModelNotFoundError(e) ||
+      preferredModel === FALLBACK_MODEL_ON_404
+    ) {
+      throw e;
+    }
+    console.warn(
+      `[gemini] model "${preferredModel}" not available (${e.status || '404'}), retrying "${FALLBACK_MODEL_ON_404}"`
+    );
+    result = await generateContentWithModel(
+      genAI,
+      FALLBACK_MODEL_ON_404,
+      systemInstruction,
+      generationConfig,
+      prompt
+    );
+  }
   const raw = result.response.text();
   const parsed = parseJsonFromModelText(raw);
   if (typeof parsed.reply !== 'string') parsed.reply = 'היי! 😊 לא הבנתי בדיוק — תוכל לפרט?';
@@ -137,4 +182,5 @@ module.exports = {
   runGeminiKibbutzTurn,
   stringifyKibbutzContext,
   DEFAULT_MODEL,
+  FALLBACK_MODEL_ON_404,
 };
