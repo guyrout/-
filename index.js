@@ -932,7 +932,7 @@ async function startCategoryClarification(res, phone, pick, opts = {}) {
 
 const NOISE_WORDS = new Set([
   'בערך', 'שילמתי', 'הוצאתי', 'יצא', 'קניתי', 'היה',
-  'שקל', 'שקלים', 'ש"ח', 'על', 'עבור', 'בשביל', 'את', 'של',
+  'שקל', 'שקלים', 'ש"ח', 'שח', 'על', 'עבור', 'בשביל', 'את', 'של',
   'לי', 'כמו', 'זה', 'היום', 'אתמול', 'עכשיו',
 ]);
 
@@ -964,7 +964,7 @@ function parseExpenseMessage(text) {
 
   let forAmount = trimmed
     .replace(/[$€£]/g, ' ')
-    .replace(/\b(?:דולרים?|דולר|אירו|euro|dollar|שקלים?|ש״ח|ש"ח|₪|nis)\b/gi, ' ')
+    .replace(/\b(?:דולרים?|דולר|אירו|euro|dollar|שקלים?|ש״ח|ש"ח|שח|₪|nis)\b/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -4012,46 +4012,12 @@ async function handleMessage(req, res) {
     return;
   }
 
-  // ─── Gemini: process.env.GEMINI_API_KEY — applyGeminiWhatsAppResult שולח את reply ב-sendTwiML (טקסט ל-WhatsApp); ברישום הוצאה נקרא saveFullRow / completeSmartExpenseFromKibbutzEntry לפני התשובה (חוץ מאישור סכום גבוה) ───
-  if (
-    isGeminiApiKeyConfigured() &&
-    session.state === 'IDLE' &&
-    !hasMedia &&
-    trimmed &&
-    !ib.btnPayload &&
-    !ib.categoryPayload
-  ) {
-    try {
-      const geminiOut = await runGeminiWithKibbutzContext(trimmed, { hasMedia: false });
-      if (!geminiOut.ok) {
-        sendTwiML(res, USER_FACING_TECH_ERROR_HE);
-        return;
-      }
-      await applyGeminiWhatsAppResult(
-        res,
-        phone,
-        waNorm,
-        userSheetValue,
-        { reply: geminiOut.reply, log_expense: false },
-        trimmed
-      );
-    } catch (e) {
-      console.error('[gemini]', e && e.message ? e.message : e);
-      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
-    }
-    return;
-  }
-
-  const bridgeMsg = tryBridgingSmallTalk(lower, trimmed);
-  if (bridgeMsg && session.state === 'IDLE' && !hasMedia) {
-    sendTwiML(res, bridgeMsg);
-    return;
-  }
-
-  // ─── SCENARIO C: NORMAL TEXT EXPENSE ───
   const { amount, description } = parseExpenseMessage(trimmed);
+  const idlePlainText =
+    session.state === 'IDLE' && !hasMedia && !ib.btnPayload && !ib.categoryPayload;
 
-  if (amount && description) {
+  // ─── רישום הוצאה בטקסט (סכום + תיאור) — לפני Gemini: אחרת Gemini חוסם ולא מגיעים לגיליון ───
+  if (idlePlainText && amount && description) {
     const pickSmartC = {
       amount,
       desc: description,
@@ -4090,7 +4056,7 @@ async function handleMessage(req, res) {
     return;
   }
 
-  if (amount && !description) {
+  if (idlePlainText && amount && !description) {
     const s = getSession(phone);
     s.state = 'AWAITING_DESCRIPTION';
     s.pendingAmount = amount;
@@ -4099,6 +4065,42 @@ async function handleMessage(req, res) {
       res,
       `קיבלתי *${formatShekelDisplay(amount)}* ש״ח.\n\nעל איזה החזר? (למשל *פנגו* / *מונית*)`
     );
+    return;
+  }
+
+  // ─── Gemini: שאלות מדיניות כשאין הודעת הוצאה מובנית (סכום+תיאור) ───
+  if (
+    isGeminiApiKeyConfigured() &&
+    session.state === 'IDLE' &&
+    !hasMedia &&
+    trimmed &&
+    !ib.btnPayload &&
+    !ib.categoryPayload
+  ) {
+    try {
+      const geminiOut = await runGeminiWithKibbutzContext(trimmed, { hasMedia: false });
+      if (!geminiOut.ok) {
+        sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+        return;
+      }
+      await applyGeminiWhatsAppResult(
+        res,
+        phone,
+        waNorm,
+        userSheetValue,
+        { reply: geminiOut.reply, log_expense: false },
+        trimmed
+      );
+    } catch (e) {
+      console.error('[gemini]', e && e.message ? e.message : e);
+      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+    }
+    return;
+  }
+
+  const bridgeMsg = tryBridgingSmallTalk(lower, trimmed);
+  if (bridgeMsg && session.state === 'IDLE' && !hasMedia) {
+    sendTwiML(res, bridgeMsg);
     return;
   }
 
