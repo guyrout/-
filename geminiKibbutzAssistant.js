@@ -1,20 +1,33 @@
 /**
- * עוזר קיבוץ מבוסס Gemini — CONTEXT מ־kibbutzData בהוראות מערכת.
- * מפתח: תמיד מ־process.env.GEMINI_API_KEY (לא מועבר מחרוזת ריקה מבחוץ).
+ * Gemini דרך Google AI — קריאות ל־**v1** (לא v1beta) דרך RequestOptions.apiVersion.
+ * מפתח: process.env.GEMINI_API_KEY
  */
 
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
 
+/** API REST יציב; ברירת המחדל של הספרייה היא v1beta */
+const GEMINI_API_VERSION = 'v1';
+
+const MODEL_NAME = 'gemini-1.5-flash';
+
+/**
+ * הוראות מערכת: כללי החזרים מ־kibbutzData (topic, keywords, limit, contact, answer).
+ */
 function buildSystemInstruction() {
-  const contextLine = `CONTEXT: ${JSON.stringify(kibbutzData)}`;
+  const contextJson = JSON.stringify(kibbutzData, null, 2);
   return [
-    contextLine,
+    'You are a professional Kibbutz Assistant for refund logging and questions.',
     '',
-    'You are a professional Kibbutz Assistant. You MUST use the provided CONTEXT to answer users. If a user logs an expense (number + item), extract the amount and topic. If they ask a question, answer based ONLY on the context. If the topic is missing from context, say you don\'t know.',
+    '=== REFUND RULES (CONTEXT) — use ONLY this data for amounts, limits, contacts, and policy text ===',
+    contextJson,
     '',
-    'Always put the user-visible text in the JSON field "reply" (Hebrew). For a logged expense set log_expense to true and fill structured fields from CONTEXT where possible.',
-    'Output must be JSON only, matching the response schema.',
+    'Rules:',
+    '- You MUST use the CONTEXT JSON above for refund rules. Each row has: topic, keywords, limit (ILS cap), contact (submission person), answer (policy summary).',
+    '- If the user logs an expense (number + what they bought), extract amount and match the best topic from CONTEXT using keywords and intent.',
+    '- If they ask a question, answer ONLY from CONTEXT. If the topic is not in CONTEXT, say you do not have that information.',
+    '- Put the user-visible message in Hebrew in the JSON field "reply". For expenses set log_expense true and fill structured fields from CONTEXT when applicable.',
+    '- Output must be JSON only matching the response schema.',
   ].join('\n');
 }
 
@@ -79,17 +92,19 @@ async function runGeminiKibbutzTurn(userMessage, options = {}) {
     throw new Error('gemini: GEMINI_API_KEY is missing or empty in process.env');
   }
 
-  // Key from env at request time (.trim() avoids newline from secret managers → 403 unregistered caller)
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
-  const model = genAI.getGenerativeModel({
-    model: 'gemini-1.5-flash',
-    systemInstruction: buildSystemInstruction(),
-    generationConfig: {
-      temperature: 0.35,
-      responseMimeType: 'application/json',
-      responseSchema: responseSchema(),
+  const model = genAI.getGenerativeModel(
+    {
+      model: MODEL_NAME,
+      systemInstruction: buildSystemInstruction(),
+      generationConfig: {
+        temperature: 0.35,
+        responseMimeType: 'application/json',
+        responseSchema: responseSchema(),
+      },
     },
-  });
+    { apiVersion: GEMINI_API_VERSION }
+  );
 
   let prompt = `USER_MESSAGE:\n${userMessage || '(ריק)'}`;
   if (hasMedia) {
@@ -122,4 +137,6 @@ function isGeminiApiKeyConfigured() {
 module.exports = {
   runGeminiKibbutzTurn,
   isGeminiApiKeyConfigured,
+  MODEL_NAME,
+  GEMINI_API_VERSION,
 };

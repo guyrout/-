@@ -26,7 +26,12 @@ const {
   estimatedRefund,
   potentialRefundForAmountAndTopic,
 } = require('./kibbutzSmart');
-const { runGeminiKibbutzTurn, isGeminiApiKeyConfigured } = require('./geminiKibbutzAssistant');
+const {
+  runGeminiKibbutzTurn,
+  isGeminiApiKeyConfigured,
+  GEMINI_API_VERSION,
+  MODEL_NAME: GEMINI_MODEL_NAME,
+} = require('./geminiKibbutzAssistant');
 const kibbutzData = require('./kibbutzData');
 
 const app = express();
@@ -2674,6 +2679,7 @@ function logConfigOnce() {
   const geminiEnv = process.env.GEMINI_API_KEY;
   const geminiOk = typeof geminiEnv === 'string' && geminiEnv.trim().length > 0;
   console.log('[config] GEMINI_API_KEY:', geminiOk ? '(set)' : '(not set — Gemini assistant disabled)');
+  console.log('[config] Gemini REST:', `${GEMINI_API_VERSION || 'v1'} · model ${GEMINI_MODEL_NAME || 'gemini-1.5-flash'}`);
   if (process.env.DEBUG_GEMINI === '1') {
     console.log(
       '[debug] GEMINI_API_KEY:',
