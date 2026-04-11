@@ -11,8 +11,9 @@ const {
   isGeminiApiKeyConfigured,
 } = require('./geminiKibbutzAssistant');
 
-/** הודעת גיבוי אחידה כש-Gemini / Drive / Sheets נכשלים */
-const TECH_ERROR_HE = 'סליחה, יש לי תקלה טכנית כרגע';
+/** מקביל ל-USER_FACING_TECH_ERROR_HE ב-index (עדכן את שני המקומות יחד) */
+const TECH_ERROR_HE =
+  'משהו נתקע אצלי רגע 😔 נסה שוב בעוד רגע.\n\nאם זה חוזר — שלח *סכום + תיאור* (בלי שאלות לעוזר).';
 
 /**
  * Gemini 1.5 Flash: כל חוקי הקיבוץ ב-user prompt בלבד (מוגדר ב-geminiKibbutzAssistant).

@@ -38,6 +38,8 @@ Here are the Kibbutz rules: ${JSON.stringify(kibbutzData)}
 User Question: ${q}
 
 Answer in Hebrew based ONLY on the rules above.
+If a rule depends on gender or age, say so clearly in your answer.
+Keep answers concise and actionable.
 `.trim();
 
     if (hasMedia) {

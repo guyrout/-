@@ -131,10 +131,12 @@ function buildSmartLogReply({
   dupSuffix,
 }) {
   let msg =
-    `*נרשם:* *${amountDisplay}* ש"ח\n` +
-    `*לפי תקרה* *${limitDisplay}* ש"ח, *החזר משוער:* *${refundDisplay}* ש"ח\n` +
-    `*הגשה מול:* *${contact}*\n` +
-    `שלח קבלה.`;
+    `*נרשם* ✓\n\n` +
+    `*סכום ברישום:* *${amountDisplay}* ש"ח\n` +
+    `*תקרה בנתונים:* *${limitDisplay}* ש"ח\n` +
+    `*החזר משוער (עד התקרה):* *${refundDisplay}* ש"ח\n` +
+    `*הגשה מול:* *${contact}*\n\n` +
+    `שלח קבלה 📎`;
   if (capNote) msg += `\n\n${capNote}`;
   if (dupSuffix) msg += dupSuffix;
   return msg;

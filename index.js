@@ -41,10 +41,11 @@ app.use(express.urlencoded({ extended: false }));
 
 const UI_DIV = '──────────────';
 
-const MEDIA_PROCESSING_ACK_MSG = 'מעלה את הקובץ… רגע.';
+const MEDIA_PROCESSING_ACK_MSG = 'מעלה את הקבלה… רגע אחד ⏳';
 
-/** הודעה אחידה לכל כשל ב-Gemini / Drive / Sheets (דרישת יציבות) */
-const USER_FACING_TECH_ERROR_HE = 'סליחה, יש לי תקלה טכנית כרגע';
+/** טון אחיד: חם, קצר, פעולה — בלי פירוט טכני למשתמש */
+const USER_FACING_TECH_ERROR_HE =
+  'משהו נתקע אצלי רגע 😔 נסה שוב בעוד רגע.\n\nאם זה חוזר — שלח *סכום + תיאור* (בלי שאלות לעוזר).';
 
 /** תשובות FAQ מ־kibbutzData: Markdown **bold** → *bold* ל-WhatsApp */
 function formatKibbutzKnowledgeAnswer(answer) {
@@ -840,11 +841,11 @@ function buildDeletionFeedbackCard(description, amount) {
   const desc = (description || '—').trim() || '—';
   const amt = formatShekelDisplay(amount);
   return (
-    `*הפעולה בוטלה*\n\n` +
+    `*בוצע — הרישום הוסר*\n\n` +
     `${UI_DIV}\n\n` +
     `~${desc} — ${amt} ש״ח~\n\n` +
     `${UI_DIV}\n\n` +
-    `השורה הוסרה מהגיליון.`
+    `השורה נמחקה מהגיליון.`
   );
 }
 
@@ -854,13 +855,13 @@ function buildSuccessRecordCard(amount, category, dateDisplay, options = {}) {
     ? `\n\n*קבלה:* שלח תמונה, או השב *כן* / *לא*.`
     : '';
   return (
-    `*הפרטים נשמרו בהצלחה*\n\n` +
+    `*נשמר* ✓\n\n` +
     `${UI_DIV}\n\n` +
     `*קטגוריה:* ${category}\n` +
     `*סכום:* *${formatShekelDisplay(amount)}* ש״ח\n` +
     `*תאריך:* ${dateDisplay}\n\n` +
     `${UI_DIV}\n\n` +
-    `הנתונים עודכנו בגיליון הקיבוץ.` +
+    `הכל עודכן בגיליון.` +
     dup +
     receiptBlock
   );
@@ -1707,7 +1708,7 @@ function momLine(curTotals, prevTotals, prevMonthName) {
     const diff = Math.round(((curAmt - prevAmt) / prevAmt) * 100);
     if (diff === 0) continue;
     const direction = diff > 0 ? 'יותר' : 'פחות';
-    lines.push(`החודש רשמת *${Math.abs(diff)}%* ${direction} על ${cat} לעומת ${prevMonthName} — עין חדה 🕵️‍♂️`);
+    lines.push(`החודש רשמת *${Math.abs(diff)}%* ${direction} על ${cat} לעומת ${prevMonthName} — ראש גבוה 📊`);
   }
   return lines.join('\n');
 }
@@ -2528,7 +2529,7 @@ async function completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userShee
 async function applyGeminiWhatsAppResult(res, phone, waNorm, userSheetValue, g, userTrimmed) {
   try {
     const fallbackClarify =
-      'הממ… לא הבנתי לגמרי 😅 תוכל לכתוב שוב בקצרה? (סכום + על מה, או שאלה על החזר)';
+      'לא קלטתי 😅 שלח שוב בקצרה: *סכום + על מה*, או שאלה על החזר.';
     const replySafe =
       g && typeof g.reply === 'string' && g.reply.trim() ? g.reply.trim() : fallbackClarify;
 
@@ -2761,40 +2762,40 @@ async function completeExpenseAfterCategoryClarification(res, phone, waNorm, use
 // ===================== Response Templates =====================
 
 function buildCategoriesList() {
-  const lines = ['*11 קטגוריות רשמיות להחזר מהקיבוץ:*', ''];
+  const lines = ['*11 קטגוריות להחזר מהקיבוץ* 📋', ''];
   for (const c of CANONICAL_CATEGORIES) lines.push(c);
   lines.push('');
-  lines.push('לא בטוחים? אשלח רשימה לבחירה — בוחרים מהרשימה, לא מנחשים.');
+  lines.push('לא בטוחים? בוחרים מהרשימה — לא מנחשים.');
   return lines.join('\n');
 }
 
 function buildGreeting() {
   return (
-    `*היי*\n\n` +
-    `אני כאן ל-*החזרי קיבוץ*: רישום קבלות וסכומים לגיליון.\n\n` +
+    `*היי* 👋\n\n` +
+    `אני עוזר עם *החזרי קיבוץ*: רישום לגיליון וקבלות לדרייב.\n\n` +
     `*איך רושמים*\n\n` +
-    `• *סכום + תיאור* (למשל *45 אוטובוס*)\n` +
-    `• *תמונת קבלה* עם טקסט — נשמר בדרייב ובגיליון\n` +
-    `• *תמונה בלבד* — אבקש אחר כך סכום ותיאור\n\n` +
-    `*פקודות*\n\n` +
+    `• *סכום + תיאור* — למשל *45 אוטובוס*\n` +
+    `• *תמונה + טקסט* — הקבלה נשמרת בדרייב\n` +
+    `• *רק תמונה* — אשאל אחר כך סכום ותיאור\n\n` +
+    `*מה אפשר לכתוב*\n\n` +
     `• *סיכום* — ריכוז החודש\n` +
-    `• *עזרה* — מדריך קצר\n` +
-    `• *מחק* — ביטול רישום\n` +
+    `• *עזרה* — כל הפקודות\n` +
+    `• *מחק* — ביטול רישום מהרשימה\n` +
     `• *ניהול* — רשימת החודש\n` +
-    `• *מה לא הוגש* / *הגשתי* — סטטוס`
+    `• *מה לא הוגש* / *הגשתי*`
   );
 }
 
 function buildHelpGuide() {
   return (
-    `*עזרה קצרה*\n\n` +
-    `*רישום:* סכום + תיאור, או קבלה (עם או בלי טקסט).\n\n` +
-    `*סיכום:* כתוב *סיכום* — מקבלים ריכוז וגרף.\n\n` +
-    `*טעות:* *מחק* — בוחרים שורה ומאשרים.\n\n` +
-    `*ניהול:* עריכת רישומי החודש.\n\n` +
+    `*עזרה* ℹ️\n\n` +
+    `*רישום:* סכום + תיאור, או תמונת קבלה (עם או בלי טקסט).\n\n` +
+    `*סיכום:* כתוב *סיכום* — ריכוז וגרף לחודש.\n\n` +
+    `*טעות בזמן:* *מחק* — בוחרים שורה ומאשרים (טקסט בלבד).\n\n` +
+    `*ניהול:* *ניהול* — עורכים רישומי החודש.\n\n` +
     `*קטגוריות:* *קטגוריות* — הרשימה המלאה.\n\n` +
     `*הגשה:* *מה לא הוגש* / *הגשתי*.\n\n` +
-    `נתקעת? שלח *שלום* ומתחילים מחדש.`
+    `נתקעת? שלח *שלום* ונתחיל מחדש.`
   );
 }
 
@@ -2805,7 +2806,12 @@ function logConfigOnce() {
   console.log('[config] TWILIO_AUTH_TOKEN:', TWILIO_AUTH_TOKEN ? '(set)' : '(missing)');
   console.log('[config] FROM_WHATSAPP_NUMBER:', FROM_WHATSAPP_NUMBER || '(missing)');
   console.log('[config] TO_WHATSAPP_NUMBER:', TO_WHATSAPP_NUMBER || '(missing)');
-  console.log('[config] GOOGLE_SHEET_ID:', GOOGLE_SHEET_ID || '(missing)');
+  const sheetIdFromEnv = !!(process.env.GOOGLE_SHEET_ID && String(process.env.GOOGLE_SHEET_ID).trim());
+  console.log(
+    '[config] GOOGLE_SHEET_ID:',
+    GOOGLE_SHEET_ID || '(missing)',
+    sheetIdFromEnv ? '(from env)' : '⚠ default baked in code — set GOOGLE_SHEET_ID on Render for your sheet'
+  );
   console.log('[config] GOOGLE_DRIVE_FOLDER_ID:', GOOGLE_DRIVE_FOLDER_ID || '(not set — Drive receipt uploads disabled)');
   console.log('[config] Google SA source:', serviceAccountLoadSource);
   if (String(serviceAccountLoadSource).includes('GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY')) {
@@ -3702,7 +3708,7 @@ async function handleMessage(req, res) {
       const data = await getCurrentMonthRows(false, waNorm);
       if (data && data.rows.length > 0) {
         const total = data.rows.reduce((s, r) => s + r.amt, 0);
-        sendTwiML(res, `${savvySummaryTotalLine(total)}\n(${data.rows.length} רישומים)\n\nשלח *סיכום* או *תראה לי* לפירוט מלא 🕵️‍♂️`);
+        sendTwiML(res, `${savvySummaryTotalLine(total)}\n(${data.rows.length} רישומים)\n\nשלח *סיכום* או *תראה לי* לפירוט מלא 📊`);
       } else {
         sendTwiML(res, 'עדיין אין החזרים החודש. רשום אחד — אל תפספס כסף שמגיע לך 💰');
       }
