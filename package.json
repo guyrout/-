@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "build": "node --check index.js && node --check handleMessage.js && node --check geminiKibbutzAssistant.js && node --check kibbutzSmart.js && node --check kibbutzData.js",
     "smoke": "SMOKE_TEST=1 node index.js"
   },
   "engines": {

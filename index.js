@@ -47,6 +47,11 @@ const MEDIA_PROCESSING_ACK_MSG = 'מעלה את הקבלה… רגע אחד ⏳'
 const USER_FACING_TECH_ERROR_HE =
   'משהו נתקע אצלי רגע 😔 נסה שוב בעוד רגע.\n\nאם זה חוזר — שלח *סכום + תיאור* (בלי שאלות לעוזר).';
 
+/** Drive 404: תיקייה לא נמצאת / אין גישה — רמז למנהל (לוגים + הודעת משתמש) */
+const USER_FACING_DRIVE_FOLDER_ERROR_HE =
+  'לא הצלחתי להעלות את הקבלה לדרייב.\n\n' +
+  '*למנהל:* *GOOGLE_DRIVE_FOLDER_ID* חייב להיות מזהה של *תיקייה* (מהכתובת …/folders/…), לשתף את התיקייה ב־Drive עם אימייל ה־Service Account כ־*עורך*, ואם זו תיקייה ב־*Shared drive* — פרוס את גרסת השרת העדכנית (תמיכה ב־Shared Drive).';
+
 /** תשובות FAQ מ־kibbutzData: Markdown **bold** → *bold* ל-WhatsApp */
 function formatKibbutzKnowledgeAnswer(answer) {
   return String(answer || '').replace(/\*\*/g, '*');
@@ -82,6 +87,25 @@ function savvySummaryTotalLine(total) {
 
 // ===================== Credentials =====================
 
+/**
+ * מזהה תיקייה מ-Render לפעמים מודבק כ-URL שלם / עם רווחים / מרכאות.
+ * מחלץ את ה-ID אחרי /folders/ כדי למנוע 404 מיותר.
+ */
+function normalizeGoogleDriveFolderId(raw) {
+  let s = String(raw ?? '').trim();
+  if (!s) return '';
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  const fromPath = s.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+  if (fromPath) return fromPath[1];
+  const noQuery = s.split(/[?#]/)[0].replace(/\/+$/, '');
+  if (/^[a-zA-Z0-9_-]+$/.test(noQuery)) return noQuery;
+  const lastSeg = noQuery.split('/').filter(Boolean).pop();
+  if (lastSeg && /^[a-zA-Z0-9_-]+$/.test(lastSeg)) return lastSeg;
+  return '';
+}
+
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || '').trim();
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || '').trim();
 const FROM_WHATSAPP_NUMBER = (process.env.FROM_WHATSAPP_NUMBER || '').trim();
@@ -89,7 +113,8 @@ const TO_WHATSAPP_NUMBER = (process.env.TO_WHATSAPP_NUMBER || '').trim();
 const GOOGLE_SHEET_ID = (
   process.env.GOOGLE_SHEET_ID || '1xd9BILngzkLX57ja4On73TIehGJIPkCmuS9aEjAhc48'
 ).trim();
-const GOOGLE_DRIVE_FOLDER_ID = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+const GOOGLE_DRIVE_FOLDER_ID_RAW = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
+const GOOGLE_DRIVE_FOLDER_ID = normalizeGoogleDriveFolderId(process.env.GOOGLE_DRIVE_FOLDER_ID);
 /** Public base URL (no trailing slash) so Twilio can fetch one-time chart PNGs from GET /__media/chart/:token */
 const PUBLIC_WEBHOOK_BASE = (process.env.PUBLIC_WEBHOOK_BASE || '').trim().replace(/\/$/, '');
 
@@ -343,6 +368,40 @@ function getDriveClient() {
   }
 }
 
+/** אחרי עליית השרת: בודק שהיעד הוא תיקייה ושל-Service Account יש גישה (לוגים, לא חוסם). */
+async function verifyDriveUploadFolderOnStartup() {
+  if (!GOOGLE_DRIVE_FOLDER_ID || !getDriveClient()) return;
+  const drive = getDriveClient();
+  try {
+    const res = await drive.files.get({
+      fileId: GOOGLE_DRIVE_FOLDER_ID,
+      fields: 'id,name,mimeType',
+      supportsAllDrives: true,
+    });
+    const mt = res.data.mimeType;
+    if (mt !== 'application/vnd.google-apps.folder') {
+      console.error(
+        '[drive] GOOGLE_DRIVE_FOLDER_ID is not a folder (mimeType:',
+        mt,
+        ') — paste folder URL …/folders/ID, not a file link.'
+      );
+      return;
+    }
+    console.log('[drive] Upload folder OK:', res.data.name || GOOGLE_DRIVE_FOLDER_ID);
+  } catch (e) {
+    const api = e.response?.data?.error;
+    const code = api?.code ?? e.response?.status;
+    const sa = serviceAccountCreds?.client_email || '(GOOGLE_CLIENT_EMAIL)';
+    console.error('[drive] Startup folder check failed:', e.response?.data || e.message);
+    if (code === 404) {
+      console.error('[drive] 404: folder missing or SA has no access — share folder in Drive (Editor) with:', sa);
+    }
+    if (code === 403) {
+      console.error('[drive] 403: forbidden — share folder with SA or use a folder inside a Shared drive the SA can access:', sa);
+    }
+  }
+}
+
 async function downloadTwilioMedia(mediaUrl) {
   try {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
@@ -390,8 +449,7 @@ async function uploadToDrive(buffer, contentType, fileName) {
     if (!drive) {
       return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
     }
-    const folderId = (process.env.GOOGLE_DRIVE_FOLDER_ID || '').trim();
-    if (!folderId) {
+    if (!GOOGLE_DRIVE_FOLDER_ID) {
       console.error('[drive] GOOGLE_DRIVE_FOLDER_ID not set');
       return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
     }
@@ -399,7 +457,7 @@ async function uploadToDrive(buffer, contentType, fileName) {
     console.log('[drive] Drive upload started:', fileName, `(${buffer.length} bytes)`);
     const fileMetadata = {
       name: fileName,
-      parents: [folderId],
+      parents: [GOOGLE_DRIVE_FOLDER_ID],
     };
 
     try {
@@ -407,6 +465,8 @@ async function uploadToDrive(buffer, contentType, fileName) {
         requestBody: fileMetadata,
         media: { mimeType: contentType, body: bufferToStream(buffer) },
         fields: 'id,webViewLink',
+        /** חובה ל-Shared Drive (Team Drive); לא מזיק ל-My Drive */
+        supportsAllDrives: true,
       });
       const id = createRes.data.id;
       const webViewLink =
@@ -415,8 +475,23 @@ async function uploadToDrive(buffer, contentType, fileName) {
       return { link: webViewLink || null, userMessage: null };
     } catch (error) {
       const api = error.response?.data?.error;
+      const code = api?.code ?? error.response?.status;
       const detail = api?.message || error.message || 'unknown';
       console.error('[drive] API error:', error.response?.data || error.message, detail);
+      if (code === 404) {
+        const saEmail = serviceAccountCreds?.client_email || '(set GOOGLE_CLIENT_EMAIL)';
+        console.error(
+          '[drive] 404: parent folder not found or no access. Fix: (1) GOOGLE_DRIVE_FOLDER_ID = folder ID from URL ' +
+            '…/folders/FOLDER_ID (2) Share that folder in Drive with Editor to:',
+          saEmail
+        );
+        return { link: null, userMessage: USER_FACING_DRIVE_FOLDER_ERROR_HE };
+      }
+      if (code === 403) {
+        const saEmail = serviceAccountCreds?.client_email || '(set GOOGLE_CLIENT_EMAIL)';
+        console.error('[drive] 403: share folder with Editor:', saEmail);
+        return { link: null, userMessage: USER_FACING_DRIVE_FOLDER_ERROR_HE };
+      }
       return { link: null, userMessage: USER_FACING_TECH_ERROR_HE };
     }
   } catch (e) {
@@ -466,6 +541,15 @@ async function handleMediaUpload(req, fileBaseName) {
   }
 }
 
+/**
+ * מתחיל הורדה+העלאה מיד; ACK נשלח במקביל כדי שלא יעכב את שימוש ב-MediaUrl של Twilio.
+ */
+async function handleMediaUploadWithParallelAck(waNorm, req, fileBaseName) {
+  const uploadPromise = handleMediaUpload(req, fileBaseName);
+  await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
+  return await uploadPromise;
+}
+
 /** Extract Google Drive file ID from webViewLink or open URL */
 function parseDriveFileIdFromUrl(url) {
   if (!url || typeof url !== 'string') return null;
@@ -483,7 +567,7 @@ async function deleteDriveFileByUrl(url) {
   const drive = getDriveClient();
   if (!drive) return false;
   try {
-    await drive.files.delete({ fileId: id });
+    await drive.files.delete({ fileId: id, supportsAllDrives: true });
     console.log(`[drive] Deleted file ${id}`);
     return true;
   } catch (e) {
@@ -1513,6 +1597,41 @@ async function getRowByIndexIfOwned(rowIndex, ownerWaNorm) {
   return row;
 }
 
+/**
+ * שורת הגיליון האחרונה שנשמרה ל-user (lastRowIndex) בלי קישור דרייב — לשחזור אחרי אובדן session.
+ */
+async function tryResolveOrphanReceiptRowForMedia(phone, waNorm) {
+  const us = getUserState(phone);
+  const idx = us.lastRowIndex;
+  const ts = us.lastRowTs || 0;
+  if (!idx || !ts) return null;
+  if (Date.now() - ts > RECEIPT_ORPHAN_ATTACH_TTL_MS) return null;
+  const row = await getRowByIndexIfOwned(idx, waNorm);
+  if (!row) return null;
+  if (sheetDriveLink(row)) return null;
+  return idx;
+}
+
+async function sendReceiptLinkedSuccessMessage(waNorm, rowIdx) {
+  const row = await getRowByIndexIfOwned(rowIdx, waNorm);
+  if (row) {
+    const amt = parseFloat(getCol(row, 'Amount')) || 0;
+    const cat = getCol(row, 'Category') || '';
+    const dupLine = await duplicateExpenseWarningLine(waNorm, amt, cat);
+    const dateDisp = String(getCol(row, 'Date') || formatNow().date);
+    const card = buildSuccessRecordCard(amt, cat, dateDisp, {
+      duplicateAppend: dupLine,
+      awaitingReceipt: false,
+    });
+    await sendReceiptSuccessQuickReply(waNorm, card);
+  } else {
+    await replyWhatsAppToUser(
+      waNorm,
+      `*הקבלה נשמרה*\n\nהקישור עודכן בגיליון.\n\nלביטול — *מחק*.`
+    );
+  }
+}
+
 async function updateRowByIndexForOwner(rowIndex, field, value, ownerWaNorm) {
   try {
     const target = await getRowByIndexIfOwned(rowIndex, ownerWaNorm);
@@ -2114,6 +2233,8 @@ async function sendWhatsAppMessage(to, body) {
 const HIGH_AMOUNT_THRESHOLD = 2000;
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const RECEIPT_IMAGE_TTL_MS = 5 * 60 * 1000;
+/** תמונה אחרי רישום כשה-session אבד — עדיין לקשר לשורה האחרונה בלי Drive (מופע 2 ב-Render / TTL) */
+const RECEIPT_ORPHAN_ATTACH_TTL_MS = 45 * 60 * 1000;
 const DELETE_FLOW_TTL_MS = 2 * 60 * 1000;
 const DAILY_PROMPT_TTL_MS = 4 * 60 * 60 * 1000;
 const MANAGEMENT_TTL_MS = 10 * 60 * 1000;
@@ -2764,7 +2885,20 @@ function logConfigOnce() {
     GOOGLE_SHEET_ID || '(missing)',
     sheetIdFromEnv ? '(from env)' : '⚠ default baked in code — set GOOGLE_SHEET_ID on Render for your sheet'
   );
-  console.log('[config] GOOGLE_DRIVE_FOLDER_ID:', GOOGLE_DRIVE_FOLDER_ID || '(not set — Drive receipt uploads disabled)');
+  console.log(
+    '[config] GOOGLE_DRIVE_FOLDER_ID:',
+    GOOGLE_DRIVE_FOLDER_ID ? `${GOOGLE_DRIVE_FOLDER_ID.slice(0, 10)}…` : '(not set — Drive receipt uploads disabled)',
+    GOOGLE_DRIVE_FOLDER_ID && GOOGLE_DRIVE_FOLDER_ID_RAW && GOOGLE_DRIVE_FOLDER_ID_RAW !== GOOGLE_DRIVE_FOLDER_ID
+      ? '(normalized from URL / trimmed)'
+      : GOOGLE_DRIVE_FOLDER_ID
+        ? '(set)'
+        : ''
+  );
+  if (GOOGLE_DRIVE_FOLDER_ID_RAW && !GOOGLE_DRIVE_FOLDER_ID) {
+    console.warn(
+      '[config] GOOGLE_DRIVE_FOLDER_ID: could not parse a folder id — use …/drive/folders/FOLDER_ID or paste the id alone'
+    );
+  }
   console.log('[config] Google SA source:', serviceAccountLoadSource);
   if (String(serviceAccountLoadSource).includes('GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY')) {
     console.log('[config] (Render) credentials from GOOGLE_CLIENT_EMAIL + GOOGLE_PRIVATE_KEY only');
@@ -2801,6 +2935,11 @@ logConfigOnce();
 // ===================== Routes =====================
 
 const TWILIO_FROM_TEST = 'whatsapp:+15551234567';
+
+/** Root must return 2xx if the host (e.g. Render) health-checks `/` by default. */
+app.get('/', (_req, res) => {
+  res.status(200).type('text/plain').send('ok');
+});
 
 app.get('/health', (_req, res) => {
   res.status(200).type('text/plain').send('ok');
@@ -3057,9 +3196,8 @@ async function handleMessage(req, res) {
         emptyTwiMLResponse(res);
         void (async () => {
           try {
-            await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
             const oldLink = us.managementEditRow?.receiptImage || '';
-            const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
+            const { link: driveLink } = await handleMediaUploadWithParallelAck(waNorm, req, receiptFileBase);
             if (driveLink && oldLink) await deleteDriveFileByUrl(oldLink);
             await updateRowDriveAndLegacy(rowNum, waNorm, driveLink || oldLink || '');
             await refreshManagementEditSnapshot(phone, waNorm);
@@ -3146,9 +3284,8 @@ async function handleMessage(req, res) {
         emptyTwiMLResponse(res);
         void (async () => {
           try {
-            await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
             const oldLink = us.managementEditRow?.receiptImage || '';
-            const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
+            const { link: driveLink } = await handleMediaUploadWithParallelAck(waNorm, req, receiptFileBase);
             if (oldLink && driveLink) await deleteDriveFileByUrl(oldLink);
             const finalImg = driveLink || oldLink;
             await updateRowDriveAndLegacy(rowNum, waNorm, finalImg || '');
@@ -3383,29 +3520,18 @@ async function handleMessage(req, res) {
       emptyTwiMLResponse(res);
       void (async () => {
         try {
-          await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
-          const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
-          if (rowIdx) await updateRowDriveAndLegacy(rowIdx, waNorm, driveLink || '');
-          resetSession(phone);
-          if (driveLink && rowIdx) {
-            const row = await getRowByIndexIfOwned(rowIdx, waNorm);
-            if (row) {
-              const amt = parseFloat(getCol(row, 'Amount')) || 0;
-              const d = sheetNotes(row) || '';
-              const cat = getCol(row, 'Category') || '';
-              const dupLine = await duplicateExpenseWarningLine(waNorm, amt, cat);
-              const dateDisp = String(getCol(row, 'Date') || formatNow().date);
-              const card = buildSuccessRecordCard(amt, cat, dateDisp, {
-                duplicateAppend: dupLine,
-                awaitingReceipt: false,
-              });
-              await sendReceiptSuccessQuickReply(waNorm, card);
-            } else {
-              await replyWhatsAppToUser(
-                waNorm,
-                `*הקבלה נשמרה*\n\nהקישור עודכן בגיליון.\n\nלביטול — *מחק*.`
-              );
+          const { link: driveLink } = await handleMediaUploadWithParallelAck(waNorm, req, receiptFileBase);
+          let targetRow = rowIdx;
+          if (driveLink && !targetRow) {
+            targetRow = await tryResolveOrphanReceiptRowForMedia(phone, waNorm);
+            if (targetRow) {
+              console.log('[whatsapp] receipt image: linked via lastRowIndex (session had no receiptRowIndex)');
             }
+          }
+          if (driveLink && targetRow) await updateRowDriveAndLegacy(targetRow, waNorm, driveLink);
+          resetSession(phone);
+          if (driveLink && targetRow) {
+            await sendReceiptLinkedSuccessMessage(waNorm, targetRow);
           } else {
             await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
           }
@@ -3484,6 +3610,35 @@ async function handleMessage(req, res) {
       await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category);
       return;
     }
+    if (hasMedia) {
+      emptyTwiMLResponse(res);
+      void (async () => {
+        try {
+          const { link: driveLink } = await handleMediaUploadWithParallelAck(waNorm, req, receiptFileBase);
+          const s1 = getSession(phone);
+          s1.state = 'AWAITING_EXPENSE_DETAILS';
+          s1.pendingDriveLink = driveLink || pendingDriveLink;
+          s1.ts = Date.now();
+          if (driveLink) {
+            await replyWhatsAppToUser(
+              waNorm,
+              '*קבלה עודכנה*\n\nעכשיו שלח *סכום + תיאור* (למשל *50 פנגו*).'
+            );
+          } else if (pendingDriveLink) {
+            await replyWhatsAppToUser(
+              waNorm,
+              'לא הצלחתי להחליף את התמונה — נשארה הקבלה הקודמת.\n\nשלח *סכום + תיאור*.'
+            );
+          } else {
+            await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
+          }
+        } catch (e) {
+          console.error('[whatsapp] AWAITING_EXPENSE_DETAILS media:', e.message);
+          await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
+        }
+      })();
+      return;
+    }
     sendTwiML(res, 'לא קלטתי סכום.\n\nשלח *סכום + תיאור* (למשל *50 אוטובוס*).');
     return;
   }
@@ -3497,8 +3652,11 @@ async function handleMessage(req, res) {
       emptyTwiMLResponse(res);
       void (async () => {
         try {
-          await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
-          const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
+          const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUploadWithParallelAck(
+            waNorm,
+            req,
+            receiptFileBase
+          );
           if (!driveLink && driveUserMsg) {
             await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
           }
@@ -3558,8 +3716,15 @@ async function handleMessage(req, res) {
     emptyTwiMLResponse(res);
     void (async () => {
       try {
-        await replyWhatsAppToUser(waNorm, MEDIA_PROCESSING_ACK_MSG);
-        const { link: driveLink, userMessage: driveUserMsg } = await handleMediaUpload(req, receiptFileBase);
+        const { link: driveLink } = await handleMediaUploadWithParallelAck(waNorm, req, receiptFileBase);
+        const orphanRow = driveLink ? await tryResolveOrphanReceiptRowForMedia(phone, waNorm) : null;
+        if (orphanRow) {
+          console.log('[whatsapp] scenario B: attached receipt to last sheet row (lost AWAITING_RECEIPT_IMAGE session)');
+          await updateRowDriveAndLegacy(orphanRow, waNorm, driveLink);
+          resetSession(phone);
+          await sendReceiptLinkedSuccessMessage(waNorm, orphanRow);
+          return;
+        }
         const s0 = getSession(phone);
         s0.state = 'AWAITING_EXPENSE_DETAILS';
         s0.pendingDriveLink = driveLink || '';
@@ -4291,11 +4456,18 @@ async function runHttpSmokeTests(port) {
 
 const LISTEN_HOST = process.env.LISTEN_HOST || '0.0.0.0';
 
-if (process.env.SMOKE_TEST === '1' && process.env.NODE_ENV === 'production') {
-  console.warn('[smoke] SMOKE_TEST=1 ignored in production — starting normal server');
+/** Render sets RENDER=true; one-shot smoke must never exit the process there (health checks fail). */
+const runningOnRender = String(process.env.RENDER || '') === 'true';
+const smokeExitMode =
+  process.env.SMOKE_TEST === '1' &&
+  process.env.NODE_ENV !== 'production' &&
+  !runningOnRender;
+
+if (process.env.SMOKE_TEST === '1' && !smokeExitMode) {
+  console.warn('[smoke] SMOKE_TEST=1: long-lived server (production or Render — no exit-after-smoke).');
 }
 
-if (process.env.SMOKE_TEST === '1' && process.env.NODE_ENV !== 'production') {
+if (smokeExitMode) {
   runLocalUnitChecks();
   const server = app.listen(PORT, LISTEN_HOST, async () => {
     console.log(`[smoke] Temp server on ${LISTEN_HOST}:${PORT}`);
@@ -4306,5 +4478,6 @@ if (process.env.SMOKE_TEST === '1' && process.env.NODE_ENV !== 'production') {
   app.listen(PORT, LISTEN_HOST, () => {
     console.log(`Listening on http://${LISTEN_HOST}:${PORT}`);
     console.log('GET /health  |  POST /whatsapp  |  POST /webhook');
+    verifyDriveUploadFolderOnStartup().catch((e) => console.error('[drive] Startup folder check:', e.message));
   });
 }

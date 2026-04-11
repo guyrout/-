@@ -42,10 +42,13 @@ function isGeminiReady() {
   return isGeminiApiKeyConfigured();
 }
 
-/** תיקיית יעד לקבלות (חובה להעלאות מוצלחות) */
+/** תיקיית יעד לקבלות — תואם לנרמול ב-index (URL מלא או מזהה בלבד) */
 function isDriveFolderConfigured() {
-  const id = process.env.GOOGLE_DRIVE_FOLDER_ID;
-  return typeof id === 'string' && id.trim().length > 0;
+  const raw = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  if (typeof raw !== 'string' || !raw.trim()) return false;
+  if (/\/folders\/[a-zA-Z0-9_-]+/.test(raw)) return true;
+  const noQuery = raw.trim().split(/[?#]/)[0].replace(/\/+$/, '');
+  return /^[a-zA-Z0-9_-]+$/.test(noQuery);
 }
 
 /** בדיקה מהירה ללוג בעלייה: האם יש חשבון שירות (אחרי טעינה ב-index) */
