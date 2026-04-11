@@ -104,8 +104,6 @@ let contentSidCategoryList = (process.env.TWILIO_CONTENT_SID_CATEGORY_LIST || ''
 /** v4: כפתורי טקסט בלבד (ללא אימוג׳י בכפתורים) */
 const CONTENT_FN_RECEIPT_QR = 'kibbutz_bot_receipt_qr_v5';
 const CONTENT_FN_CATEGORY_LIST = 'kibbutz_bot_category_list_v5';
-const CONTENT_FN_CATEGORY_CONFIRM = 'kibbutz_bot_cat_confirm_v5';
-let contentSidCategoryConfirm = (process.env.TWILIO_CONTENT_SID_CATEGORY_CONFIRM || '').trim();
 let contentTemplatesInitPromise = null;
 
 function fmtWA(num) {
@@ -1198,37 +1196,6 @@ async function createCategoryListTemplate() {
   return sid;
 }
 
-async function createCategoryConfirmTemplate() {
-  const payload = {
-    friendly_name: CONTENT_FN_CATEGORY_CONFIRM,
-    language: 'he',
-    variables: { 1: 'שאלה' },
-    types: {
-      'twilio/quick-reply': {
-        body: '{{1}}',
-        actions: [
-          {
-            type: 'QUICK_REPLY',
-            title: clipWhatsAppButtonTitle('כן', 20),
-            id: QR_PAYLOAD_CAT_YES,
-          },
-          {
-            type: 'QUICK_REPLY',
-            title: clipWhatsAppButtonTitle('לא, בחר מחדש', 20),
-            id: QR_PAYLOAD_CAT_NO,
-          },
-        ],
-      },
-    },
-  };
-  let sid = await postTwilioContentTemplate(payload);
-  if (!sid) {
-    const m = await fetchContentFriendlyNameToSid();
-    sid = m.get(CONTENT_FN_CATEGORY_CONFIRM) || '';
-  }
-  return sid;
-}
-
 async function initializeWhatsAppContentTemplates() {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) return;
   try {
@@ -1237,15 +1204,11 @@ async function initializeWhatsAppContentTemplates() {
     if (!contentSidReceiptQr) contentSidReceiptQr = await createReceiptQuickReplyTemplate();
     if (!contentSidCategoryList) contentSidCategoryList = byName.get(CONTENT_FN_CATEGORY_LIST) || '';
     if (!contentSidCategoryList) contentSidCategoryList = await createCategoryListTemplate();
-    if (!contentSidCategoryConfirm) contentSidCategoryConfirm = byName.get(CONTENT_FN_CATEGORY_CONFIRM) || '';
-    if (!contentSidCategoryConfirm) contentSidCategoryConfirm = await createCategoryConfirmTemplate();
     console.log(
       '[config] Twilio Content SIDs:',
       contentSidReceiptQr ? `${contentSidReceiptQr.slice(0, 8)}…` : '(receipt QR off)',
       '|',
-      contentSidCategoryList ? `${contentSidCategoryList.slice(0, 8)}…` : '(category list off)',
-      '|',
-      contentSidCategoryConfirm ? `${contentSidCategoryConfirm.slice(0, 8)}…` : '(cat confirm off)'
+      contentSidCategoryList ? `${contentSidCategoryList.slice(0, 8)}…` : '(category list off)'
     );
   } catch (e) {
     console.warn('[twilio-content] initialize:', e.message);
@@ -2184,7 +2147,7 @@ const EXPENSE_INTERACTIVE_STATES = new Set([
  *   AWAITING_RECEIPT_IMAGE  — text-first: waiting for image or כן/לא (5 min)
  *   AWAITING_EXPENSE_DETAILS — image-first: waiting for text (amount+desc)
  *   AWAITING_CATEGORY_CLARIFICATION — רשימת 11 קטגוריות
- *   AWAITING_CATEGORY_CONFIRM — אישור קטגוריה אחרי זיהוי אוטומטי
+ *   AWAITING_CATEGORY_CONFIRM — ירושה בלבד (מי שנתקע באישור ישן); זרימה חדשה שומרת מיד
  *   AWAITING_DAILY_REPLY
  *   AWAITING_DELETE_SELECTION / AWAITING_DELETE_CONFIRM — guided delete (2 min TTL)
  *   MANAGEMENT_* — full-month edit flow (10 min TTL)
@@ -2376,27 +2339,6 @@ async function saveFullRow(phone, userSheetValue, amount, desc, category, driveL
   us.lastRowIndex = rowIndex;
   us.lastRowTs = Date.now();
   return rowIndex;
-}
-
-async function beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick, suggestedCategory, opts = {}) {
-  const useOutboundApi = !!opts.useOutboundApi;
-  const s = getSession(phone);
-  s.state = 'AWAITING_CATEGORY_CONFIRM';
-  s.pendingCategoryPick = { ...pick, userSheetValue };
-  s.pendingSuggestedCategory = suggestedCategory;
-  s.ts = Date.now();
-  await ensureWhatsAppContentTemplates();
-  const line = `לשייך ל-*${suggestedCategory}*?`;
-  if (contentSidCategoryConfirm && waNorm) {
-    const ok = await sendWhatsAppContentMessage(waNorm, contentSidCategoryConfirm, { 1: line });
-    if (ok) {
-      if (!useOutboundApi && res && !res.headersSent) emptyTwiMLResponse(res);
-      return;
-    }
-  }
-  const fallback = `${line}\n\n*כן* / *לא*, או הכפתורים למטה.`;
-  if (useOutboundApi && waNorm) await replyWhatsAppToUser(waNorm, fallback);
-  else if (res && !res.headersSent) sendTwiML(res, fallback);
 }
 
 /** כמה נושאים אפשריים — בוחרים במספר או בשם */
@@ -2663,7 +2605,14 @@ async function tryProceedSmartKibbutzExpense(res, phone, waNorm, userSheetValue,
   return completeSmartExpenseFromKibbutzEntry(res, phone, waNorm, userSheetValue, pick, matches[0], opts);
 }
 
-async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category) {
+/**
+ * שמירת שורה אחרי שקטגוריה ידועה.
+ * opts.useOutboundApi — אחרי empty TwiML / בלי res (תרחיש מדיה); שולח הודעות דרך REST.
+ */
+async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category, opts = {}) {
+  const forceOutbound = !!(opts && opts.useOutboundApi && waNorm);
+  const twimlClosed = forceOutbound || !!(res && res.headersSent);
+
   try {
     const amount = pick.amount;
     const desc = pick.desc;
@@ -2679,10 +2628,10 @@ async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue,
       s.pendingCategory = category;
       s.pendingDriveLink = receiptImage;
       s.ts = Date.now();
-      sendTwiML(
-        res,
-        `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`
-      );
+      const highMsg =
+        `*אישור סכום*\n\nהסכום *${formatShekelDisplay(amount)}* ש״ח גבוה מהרגיל.\n\n*נכון?* השב *כן* או *לא*.`;
+      if (twimlClosed) await replyWhatsAppToUser(waNorm, highMsg);
+      else sendTwiML(res, highMsg);
       return;
     }
 
@@ -2695,22 +2644,25 @@ async function proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue,
       });
       resetSession(phone);
       if (receiptImage) {
-        emptyTwiMLResponse(res);
+        if (res && !res.headersSent) emptyTwiMLResponse(res);
         await sendReceiptSuccessQuickReply(waNorm, card);
         return;
       }
-      sendTwiML(res, card);
+      if (twimlClosed) await replyWhatsAppToUser(waNorm, card);
+      else sendTwiML(res, card);
       const ns = getSession(phone);
       ns.state = 'AWAITING_RECEIPT_IMAGE';
       ns.receiptRowIndex = rowIdx;
       ns.ts = Date.now();
     } catch (e) {
       console.error('[sheets] append failed:', e.message);
-      sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+      if (twimlClosed) await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
+      else sendTwiML(res, USER_FACING_TECH_ERROR_HE);
     }
   } catch (e) {
     console.error('[sheets] proceedAfterCategoryConfirmed:', e && e.message ? e.message : e);
-    if (res && !res.headersSent) sendTwiML(res, USER_FACING_TECH_ERROR_HE);
+    if (twimlClosed) await replyWhatsAppToUser(waNorm, USER_FACING_TECH_ERROR_HE);
+    else if (res && !res.headersSent) sendTwiML(res, USER_FACING_TECH_ERROR_HE);
   }
 }
 
@@ -3529,7 +3481,7 @@ async function handleMessage(req, res) {
         receipt: pendingDriveLink ? 'Yes' : 'No',
         receiptImage: pendingDriveLink || '',
       };
-      await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pick, category, {});
+      await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pick, category);
       return;
     }
     sendTwiML(res, 'לא קלטתי סכום.\n\nשלח *סכום + תיאור* (למשל *50 אוטובוס*).');
@@ -3591,7 +3543,7 @@ async function handleMessage(req, res) {
             receipt: driveLink ? 'Yes' : 'No',
             receiptImage: driveLink || '',
           };
-          await beginCategoryConfirmFlow(null, waNorm, phone, userSheetValue, pickA, category, {
+          await proceedAfterCategoryConfirmed(null, phone, waNorm, userSheetValue, pickA, category, {
             useOutboundApi: true,
           });
         } catch (e) {
@@ -3793,7 +3745,7 @@ async function handleMessage(req, res) {
         receipt: 'No',
         receiptImage: '',
       };
-      await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickD1, category, {});
+      await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pickD1, category);
       return;
     }
 
@@ -3832,7 +3784,7 @@ async function handleMessage(req, res) {
       receipt: 'No',
       receiptImage: '',
     };
-    await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickD2, category, {});
+    await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pickD2, category);
     return;
   }
 
@@ -3883,7 +3835,7 @@ async function handleMessage(req, res) {
         receipt: 'No',
         receiptImage: '',
       };
-      await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickAm, resolved, {});
+      await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pickAm, resolved);
       return;
     }
     resetSession(phone);
@@ -4061,7 +4013,7 @@ async function handleMessage(req, res) {
       receipt: 'No',
       receiptImage: '',
     };
-    await beginCategoryConfirmFlow(res, waNorm, phone, userSheetValue, pickC, category, {});
+    await proceedAfterCategoryConfirmed(res, phone, waNorm, userSheetValue, pickC, category);
     return;
   }
 
