@@ -5,7 +5,11 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const kibbutzData = require('./kibbutzData');
 
-const MODEL_NAME = 'gemini-1.5-flash';
+/** מזהה מודל — ניתן לעקוף ב-Render: GEMINI_MODEL=gemini-2.0-flash וכו׳ */
+const MODEL_NAME = (process.env.GEMINI_MODEL || 'gemini-1.5-flash').trim() || 'gemini-1.5-flash';
+
+/** v1beta מומלץ ל-Google AI Studio; v1 לעיתים דורש שמות מודל אחרים (404 אם לא תואם) */
+const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || 'v1beta').trim() || 'v1beta';
 
 /**
  * @returns {{ reply: string, log_expense: false }}
@@ -22,7 +26,10 @@ async function runGeminiKibbutzTurn(userMessage, options = {}) {
 
   try {
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
-    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+    const model = genAI.getGenerativeModel(
+      { model: MODEL_NAME },
+      { apiVersion: GEMINI_API_VERSION }
+    );
 
     const q = userMessage || '(ריק)';
     let prompt = `
@@ -56,7 +63,15 @@ Answer in Hebrew based ONLY on the rules above.
       log_expense: false,
     };
   } catch (e) {
-    console.error('[gemini]', e && e.message ? e.message : e);
+    const status = e && (e.status ?? e.statusCode ?? e.code);
+    const details = e && e.errorDetails ? JSON.stringify(e.errorDetails).slice(0, 500) : '';
+    console.error('[gemini] request failed:', {
+      model: MODEL_NAME,
+      apiVersion: GEMINI_API_VERSION,
+      status: status != null ? status : undefined,
+      message: e && e.message ? e.message : String(e),
+      details: details || undefined,
+    });
     throw e;
   }
 }
@@ -87,8 +102,6 @@ function getGeminiUserFacingError(err) {
   const short = m.replace(/\s+/g, ' ').trim().slice(0, 180);
   return `*שגיאה בחיבור לעוזר (Gemini)*\n\n${short || 'שגיאה לא ידועה'}\n\nנסה שוב או שלח *סכום + תיאור* בלי העוזר.`;
 }
-
-const GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || 'v1beta').trim() || 'v1beta';
 
 module.exports = {
   runGeminiKibbutzTurn,

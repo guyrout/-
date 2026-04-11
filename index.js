@@ -2827,7 +2827,10 @@ function logConfigOnce() {
   const geminiEnv = process.env.GEMINI_API_KEY;
   const geminiOk = typeof geminiEnv === 'string' && geminiEnv.trim().length > 0;
   console.log('[config] GEMINI_API_KEY:', geminiOk ? '(set)' : '(not set — Gemini assistant disabled)');
-  console.log('[config] Gemini REST:', `${GEMINI_API_VERSION || 'v1'} · model ${GEMINI_MODEL_NAME || 'gemini-1.5-flash'}`);
+  console.log(
+    '[config] Gemini:',
+    `${GEMINI_API_VERSION || 'v1beta'} · model ${GEMINI_MODEL_NAME || 'gemini-1.5-flash'} (override: GEMINI_MODEL / GEMINI_API_VERSION)`
+  );
   if (process.env.DEBUG_GEMINI === '1') {
     console.log(
       '[debug] GEMINI_API_KEY:',
